@@ -18,8 +18,12 @@ Usage:
     d.close()
 """
 
+import concurrent.futures
 import json
+import re
 import socket
+import struct
+import subprocess
 import time
 from typing import Optional
 
@@ -34,6 +38,8 @@ def _sn() -> str:
 
 
 class CozyLifeDevice:
+    """TCP client for a single CozyLife smart device."""
+
     def __init__(self, ip: str):
         self.ip = ip
         self._sock: Optional[socket.socket] = None
@@ -43,13 +49,17 @@ class CozyLifeDevice:
     # Connection
     # ------------------------------------------------------------------
 
-    def _connect(self):
+    def _connect(self) -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(5)
+        # SO_LINGER l_onoff=1 l_linger=0: close() sends RST immediately
+        # rather than lingering, so the device sees the drop even if we die hard.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
         s.connect((self.ip, _PORT))
         self._sock = s
 
-    def close(self):
+    def close(self) -> None:
+        """Close the TCP connection."""
         if self._sock:
             try:
                 self._sock.close()
@@ -57,37 +67,37 @@ class CozyLifeDevice:
                 pass
             self._sock = None
 
-    def __enter__(self):
+    def __enter__(self) -> "CozyLifeDevice":
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, *_) -> None:
         self.close()
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"CozyLifeDevice(ip={self.ip})"
 
     # ------------------------------------------------------------------
     # Low-level protocol
     # ------------------------------------------------------------------
 
-    def _build(self, cmd: int, payload: dict) -> bytes:
+    def _build(self, command: int, payload: dict) -> bytes:
         sn = _sn()
-        if cmd == 3:    # SET
-            msg = {"pv": 0, "cmd": cmd, "sn": sn,
+        if command == 3:    # SET
+            msg = {"pv": 0, "cmd": command, "sn": sn,
                    "msg": {"attr": [int(k) for k in payload], "data": payload}}
-        elif cmd == 2:  # QUERY
-            msg = {"pv": 0, "cmd": cmd, "sn": sn, "msg": {"attr": [0]}}
-        elif cmd == 0:  # INFO
-            msg = {"pv": 0, "cmd": cmd, "sn": sn, "msg": {}}
+        elif command == 2:  # QUERY
+            msg = {"pv": 0, "cmd": command, "sn": sn, "msg": {"attr": [0]}}
+        elif command == 0:  # INFO
+            msg = {"pv": 0, "cmd": command, "sn": sn, "msg": {}}
         else:
-            raise ValueError(f"Unknown cmd: {cmd}")
+            raise ValueError(f"Unknown command: {command}")
         return (json.dumps(msg, separators=(",", ":")) + "\r\n").encode()
 
-    def _send(self, cmd: int, payload: dict = {}) -> None:
-        self._sock.send(self._build(cmd, payload))
+    def _send(self, command: int, payload: Optional[dict] = None) -> None:
+        self._sock.send(self._build(command, payload or {}))
 
-    def _send_recv(self, cmd: int, payload: dict = {}) -> dict:
-        packet = self._build(cmd, payload)
+    def _send_recv(self, command: int, payload: Optional[dict] = None) -> dict:
+        packet = self._build(command, payload or {})
         sn = json.loads(packet.strip())["sn"]
         self._sock.send(packet)
 
@@ -126,9 +136,11 @@ class CozyLifeDevice:
         return self._send_recv(2)
 
     def turn_on(self) -> None:
+        """Turn the device on."""
         self._send(3, {"1": 255})
 
     def turn_off(self) -> None:
+        """Turn the device off."""
         self._send(3, {"1": 0})
 
     def set_brightness(self, brightness: int) -> None:
@@ -155,35 +167,59 @@ class CozyLifeDevice:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def discover(timeout: float = 2.0) -> list["CozyLifeDevice"]:
+    def discover(timeout: float = 2.0, scan_fallback: bool = True) -> list["CozyLifeDevice"]:
         """
-        Broadcast a UDP probe and return CozyLifeDevice instances for every
-        device that responds.  Devices must be on the same subnet.
-        """
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(0.2)
+        Discover devices in two stages:
+        1. UDP broadcast on port 6095 — fast, requires AP isolation to be OFF.
+        2. TCP subnet scan on port 5555 — slower fallback when UDP finds nothing.
 
+        If your router has AP/client isolation enabled, UDP will always fail.
+        Disable it in your router's wireless settings, or pass IPs directly.
+        """
+        found_ips: list[str] = []
+
+        # --- Stage 1: UDP broadcast, bound to each local interface ---
+        local_ips = _get_local_ips()
         probe = ('{"cmd":0,"pv":0,"sn":"' + _sn() + '","msg":{}}').encode()
-        for _ in range(3):
-            sock.sendto(probe, (_DISCOVERY_ADDR, _DISCOVERY_PORT))
-            time.sleep(0.03)
 
-        ips: list[str] = []
+        socks = []
+        for local_ip in local_ips:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((local_ip, 0))
+                s.settimeout(0.2)
+                for _ in range(3):
+                    s.sendto(probe, (_DISCOVERY_ADDR, _DISCOVERY_PORT))
+                socks.append(s)
+            except OSError:
+                pass
+
         deadline = time.time() + timeout
         while time.time() < deadline:
-            try:
-                _, addr = sock.recvfrom(1024)
-                if addr[0] not in ips:
-                    ips.append(addr[0])
-            except socket.timeout:
-                continue
-        sock.close()
+            for s in socks:
+                try:
+                    _, addr = s.recvfrom(1024)
+                    if addr[0] not in found_ips:
+                        found_ips.append(addr[0])
+                except socket.timeout:
+                    pass
+        for s in socks:
+            s.close()
+
+        # --- Stage 2: TCP subnet scan if UDP found nothing ---
+        if not found_ips and scan_fallback:
+            print(
+                "UDP discovery found nothing — "
+                "falling back to TCP subnet scan (this takes a few seconds)..."
+            )
+            found_ips = _tcp_scan(local_ips)
 
         devices = []
-        for ip in ips:
+        for device_ip in found_ips:
             try:
-                devices.append(CozyLifeDevice(ip))
+                devices.append(CozyLifeDevice(device_ip))
             except OSError:
                 pass
         return devices
@@ -192,6 +228,49 @@ class CozyLifeDevice:
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+def _get_local_ips() -> list[str]:
+    """Return all non-loopback IPv4 addresses on this machine."""
+    try:
+        out = subprocess.run(
+            ["ifconfig"], capture_output=True, text=True, check=False
+        ).stdout
+        addrs = re.findall(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+        return [a for a in addrs if not a.startswith("127.")]
+    except OSError:
+        return []
+
+
+def _tcp_scan(local_ips: list[str]) -> list[str]:
+    """
+    Scan each /24 subnet of the given local IPs for open port 5555.
+    Uses 50 parallel threads; typically completes in 2-4 seconds.
+    """
+    targets: list[str] = []
+    for local_ip in local_ips:
+        prefix = ".".join(local_ip.split(".")[:3])
+        for i in range(1, 255):
+            candidate = f"{prefix}.{i}"
+            if candidate not in targets and candidate != local_ip:
+                targets.append(candidate)
+
+    def probe(target: str) -> Optional[str]:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            s.connect((target, _PORT))
+            s.close()
+            return target
+        except OSError:
+            return None
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as ex:
+        for result in ex.map(probe, targets):
+            if result:
+                results.append(result)
+    return results
+
 
 def _rgb_to_hs(r: int, g: int, b: int) -> tuple[float, float]:
     r_, g_, b_ = r / 255, g / 255, b / 255
@@ -220,32 +299,32 @@ if __name__ == "__main__":
 
     if len(sys.argv) < 2:
         print("Discovering devices...")
-        found = CozyLifeDevice.discover()
-        if not found:
+        discovered = CozyLifeDevice.discover()
+        if not discovered:
             print("No devices found.")
-        for d in found:
+        for d in discovered:
             print(d, d.query())
         sys.exit(0)
 
-    ip = sys.argv[1]
-    cmd = sys.argv[2] if len(sys.argv) > 2 else "query"
+    target_ip = sys.argv[1]
+    target_cmd = sys.argv[2] if len(sys.argv) > 2 else "query"
 
-    with CozyLifeDevice(ip) as d:
-        if cmd == "on":
+    with CozyLifeDevice(target_ip) as d:
+        if target_cmd == "on":
             d.turn_on()
-        elif cmd == "off":
+        elif target_cmd == "off":
             d.turn_off()
-        elif cmd == "info":
+        elif target_cmd == "info":
             print(d.info())
-        elif cmd == "query":
+        elif target_cmd == "query":
             print(d.query())
-        elif cmd == "brightness":
+        elif target_cmd == "brightness":
             d.set_brightness(int(sys.argv[3]))
-        elif cmd == "temp":
+        elif target_cmd == "temp":
             d.set_color_temp(int(sys.argv[3]))
-        elif cmd == "hs":
+        elif target_cmd == "hs":
             d.set_hs(float(sys.argv[3]), float(sys.argv[4]))
-        elif cmd == "rgb":
+        elif target_cmd == "rgb":
             d.set_rgb(int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]))
         else:
-            print(f"Unknown command: {cmd}")
+            print(f"Unknown command: {target_cmd}")
