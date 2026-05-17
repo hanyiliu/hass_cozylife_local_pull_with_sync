@@ -94,6 +94,8 @@ class CozyLifeDevice:
         return (json.dumps(msg, separators=(",", ":")) + "\r\n").encode()
 
     def _send(self, command: int, payload: Optional[dict] = None) -> None:
+        if self._sock is None:
+            raise OSError("not connected")
         self._sock.send(self._build(command, payload or {}))
 
     def _send_recv(self, command: int, payload: Optional[dict] = None) -> dict:
