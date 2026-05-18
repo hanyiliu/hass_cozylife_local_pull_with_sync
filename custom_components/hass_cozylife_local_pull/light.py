@@ -67,12 +67,51 @@ class CozyLifeLight(LightEntity):
         if not self._attr_supported_color_modes:
             self._attr_supported_color_modes.add(ColorMode.ONOFF)
 
-        self._attr_is_on = True
-        self._attr_brightness = 255
+        # Derive initial color mode from supported modes rather than hard-coding
+        if ColorMode.COLOR_TEMP in self._attr_supported_color_modes:
+            self._attr_color_mode = ColorMode.COLOR_TEMP
+        elif ColorMode.HS in self._attr_supported_color_modes:
+            self._attr_color_mode = ColorMode.HS
+        elif ColorMode.BRIGHTNESS in self._attr_supported_color_modes:
+            self._attr_color_mode = ColorMode.BRIGHTNESS
+        else:
+            self._attr_color_mode = ColorMode.ONOFF
+
+        # Start as unknown until async_added_to_hass syncs real device state
+        self._attr_is_on = False
+        self._attr_brightness = None
         self._attr_hs_color = None
-        self._attr_color_temp_kelvin = 3500
-        self._attr_color_mode = ColorMode.COLOR_TEMP
+        self._attr_color_temp_kelvin = None
         self._attr_available = True
+
+    async def async_added_to_hass(self) -> None:
+        """Sync initial state from device once added to HA."""
+        state = await self.hass.async_add_executor_job(self._tcp_client.query)
+        if state:
+            self._apply_state(state)
+            self.async_write_ha_state()
+
+    def _apply_state(self, state: dict) -> None:
+        """Update attributes from a raw device query result."""
+        self._attr_is_on = int(state.get('1', 0)) != 0
+
+        if '4' in state:
+            self._attr_brightness = round(int(state['4']) * 255 / 1000)
+
+        # Work mode 0 = white/color-temp, 1 = color/HS
+        work_mode = int(state.get('2', 0))
+        if work_mode == 1 and ColorMode.HS in self._attr_supported_color_modes:
+            if '5' in state and '6' in state:
+                self._attr_hs_color = (float(state['5']), float(state['6']) / 10)
+            self._attr_color_mode = ColorMode.HS
+            self._attr_color_temp_kelvin = None
+        elif ColorMode.COLOR_TEMP in self._attr_supported_color_modes and '3' in state:
+            kelvin_range = self._attr_max_color_temp_kelvin - self._attr_min_color_temp_kelvin
+            self._attr_color_temp_kelvin = round(
+                int(state['3']) / 1000 * kelvin_range + self._attr_min_color_temp_kelvin
+            )
+            self._attr_color_mode = ColorMode.COLOR_TEMP
+            self._attr_hs_color = None
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Instruct the light to turn on with optimistic updates."""
@@ -95,8 +134,6 @@ class CozyLifeLight(LightEntity):
             payload['5'] = int(target_hs_color[0])
             payload['6'] = int(target_hs_color[1] * 10)
         elif active_mode == ColorMode.COLOR_TEMP and target_color_temp_kelvin:
-            if target_color_temp_kelvin is None:
-                target_color_temp_kelvin = 3500
             kelvin_range = self._attr_max_color_temp_kelvin - self._attr_min_color_temp_kelvin
             normalized_val = (target_color_temp_kelvin - self._attr_min_color_temp_kelvin) / kelvin_range
             payload['3'] = round(max(0, min(1000, normalized_val * 1000)))
