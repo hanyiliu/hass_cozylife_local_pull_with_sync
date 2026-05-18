@@ -12,7 +12,7 @@ Usage:
     print(d.query())
     d.turn_on()
     d.set_brightness(128)
-    d.set_color_temp(300)   # mireds (153–500)
+    d.set_color_temp(3500)  # Kelvin (2000=warm – 6500=cool)
     d.set_hs(240, 80)       # hue 0–360, saturation 0–100
     d.turn_off()
     d.close()
@@ -146,13 +146,14 @@ class CozyLifeDevice:
         self._send(3, {"1": 0})
 
     def set_brightness(self, brightness: int) -> None:
-        """brightness: 0–255 (HA scale), converted internally to 0–1000."""
-        value = max(0, min(255, brightness)) * 4
+        """brightness: 0–255, converted internally to 0–1000."""
+        value = round(max(0, min(255, brightness)) * 1000 / 255)
         self._send(3, {"1": 255, "4": value})
 
-    def set_color_temp(self, mireds: int) -> None:
-        """mireds: 153–500 (standard HA range)."""
-        value = 1000 - max(153, min(500, mireds)) * 2
+    def set_color_temp(self, kelvin: int) -> None:
+        """kelvin: 2000 (warm) – 6500 (cool)."""
+        k = max(2000, min(6500, kelvin))
+        value = round((k - 2000) / (6500 - 2000) * 1000)
         self._send(3, {"1": 255, "3": value})
 
     def set_hs(self, hue: float, saturation: float) -> None:
@@ -323,7 +324,7 @@ if __name__ == "__main__":
         elif target_cmd == "brightness":
             d.set_brightness(int(sys.argv[3]))
         elif target_cmd == "temp":
-            d.set_color_temp(int(sys.argv[3]))
+            d.set_color_temp(int(sys.argv[3]))   # Kelvin, e.g. 3500
         elif target_cmd == "hs":
             d.set_hs(float(sys.argv[3]), float(sys.argv[4]))
         elif target_cmd == "rgb":

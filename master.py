@@ -55,7 +55,7 @@ SETTINGS_META: dict[str, list[dict]] = {
         {"key": "hue",        "label": "Hue",        "min": 0.0,   "max": 360.0, "step": 2.0,  "fmt": "{:.0f}°"},
         {"key": "saturation", "label": "Saturation", "min": 0.0,   "max": 100.0, "step": 2.0,  "fmt": "{:.0f}%"},
         {"key": "brightness", "label": "Brightness", "min": 0.0,   "max": 255.0, "step": 5.0,  "fmt": "{:.0f}"},
-        {"key": "color_temp", "label": "Color Temp", "min": 153.0, "max": 500.0, "step": 10.0, "fmt": "{:.0f} mired"},
+        {"key": "color_temp", "label": "Color Temp", "min": 2000.0, "max": 6500.0, "step": 100.0, "fmt": "{:.0f} K"},
         {"key": "use_temp",   "label": "Color Mode", "min": 0.0,   "max": 1.0,   "step": 1.0,
          "fmt_fn": lambda v: "Hue / Sat" if v < 0.5 else "Color Temp"},
     ],
@@ -67,7 +67,7 @@ DEFAULT_SETTINGS: dict[str, dict] = {
     "audio":  {"smoothing": 0.25, "gain_decay": 0.995,
                "freq_min": 80.0, "freq_max": 8000.0, "light_interval": 0.05, "hue_spread": 0.0},
     "manual": {"hue": 0.0, "saturation": 90.0, "brightness": 200.0,
-               "color_temp": 300.0, "use_temp": 0.0},
+               "color_temp": 3500.0, "use_temp": 0.0},
 }
 
 BAR_W = 14
@@ -156,7 +156,7 @@ class Controller:
                 if mode == "disco":
                     hue = random.uniform(0, 360)
                     sat = random.uniform(s.get("sat_min", 60), s.get("sat_max", 100))
-                    bri = int(s.get("bri", 255)) * 4
+                    bri = round(int(s.get("bri", 255)) * 1000 / 255)
                     device._send(3, {"1": 255, "4": bri,
                                      "5": int(hue), "6": int(sat * 10)})
                     self._stop.wait(s.get("interval", 0.05))
@@ -166,7 +166,7 @@ class Controller:
                         h, b, sat = self._a_hue, self._a_bri, self._a_sat
                     h = (h + idx * s.get("hue_spread", 0.0)) % 360
                     if b > 5:
-                        device._send(3, {"1": 255, "4": b * 4,
+                        device._send(3, {"1": 255, "4": round(b * 1000 / 255),
                                          "5": int(h), "6": int(sat * 10)})
                     self._stop.wait(s.get("light_interval", 0.05))
 
@@ -224,10 +224,11 @@ class Controller:
 
     def _push_manual(self) -> None:
         s   = self.settings["manual"]
-        bri = int(s.get("brightness", 200)) * 4
+        bri = round(int(s.get("brightness", 200)) * 1000 / 255)
         if s.get("use_temp", 0) >= 0.5:
+            k = s.get("color_temp", 3500)
             payload: dict = {"1": 255, "4": bri,
-                             "3": int(1000 - s.get("color_temp", 300) * 2)}
+                             "3": round((k - 2000) / (6500 - 2000) * 1000)}
         else:
             payload = {"1": 255, "4": bri,
                        "5": int(s.get("hue", 0)),
