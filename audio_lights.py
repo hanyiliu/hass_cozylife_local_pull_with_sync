@@ -106,9 +106,9 @@ def light_worker(device: CozyLifeDevice, stop: threading.Event):
             try:
                 device._send(3, {
                     "1": 255,
-                    "4": b * 4,          # brightness 0–1000
-                    "5": int(h),         # hue 0–360
-                    "6": int(s * 10),    # sat 0–1000
+                    "4": round(b * 1000 / 255),  # brightness 0–1000
+                    "5": int(h),                  # hue 0–360
+                    "6": int(s * 10),             # sat 0–1000
                 })
             except OSError:
                 pass
