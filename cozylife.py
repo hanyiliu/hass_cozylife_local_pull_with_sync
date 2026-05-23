@@ -106,23 +106,17 @@ class CozyLifeDevice:
     def _reconnect(self) -> None:
         """Close any broken socket and open a fresh connection."""
         self.close()
-        time.sleep(0.5)
         self._connect()
 
     def _send(self, command: int, payload: Optional[dict] = None) -> None:
-        packet = self._build(command, payload or {})
-        for attempt in range(2):
-            if self._sock is None:
-                self._connect()
-            try:
-                self._sock.send(packet)
-                return
-            except OSError:
-                # Socket is dead — reconnect once before giving up.
-                self.close()
-                if attempt == 0:
-                    time.sleep(0.5)
-        raise OSError(f"send failed after reconnect: {self.ip}")
+        if self._sock is None:
+            self._connect()
+        try:
+            self._sock.send(self._build(command, payload or {}))
+        except OSError:
+            # Socket is dead — close it so the caller can reconnect.
+            self.close()
+            raise
 
     def _send_recv(self, command: int, payload: Optional[dict] = None) -> dict:
         packet = self._build(command, payload or {})

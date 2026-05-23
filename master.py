@@ -234,7 +234,8 @@ class Controller:
             self._a_stream = None
         self._stop.set()
         for t in self._workers:
-            t.join(timeout=6.0)  # must exceed socket send timeout (5s)
+            # Allow up to 7 s: socket timeout (5 s) + reconnect overhead (2 s).
+            t.join(timeout=7.0)
         self._workers.clear()
 
     # ── per-device workers ────────────────────────────────────────────────────
@@ -262,7 +263,15 @@ class Controller:
                     self._stop.wait(s.get("light_interval", 0.05))
 
             except OSError:
-                self._stop.wait(1.0)
+                device.close()
+                # Wait briefly (honouring stop), then attempt a reconnect so
+                # the worker recovers automatically if the device comes back.
+                if self._stop.wait(1.0):
+                    return
+                try:
+                    device._reconnect()
+                except OSError:
+                    pass  # next iteration will retry
 
     # ── audio ─────────────────────────────────────────────────────────────────
 

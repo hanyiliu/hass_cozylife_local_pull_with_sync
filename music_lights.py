@@ -233,7 +233,14 @@ def _light_worker(device: CozyLifeDevice, stop: threading.Event) -> None:
                     "6": int(s * 10),
                 })
             except OSError:
-                pass
+                # Socket closed by _send — wait, then reconnect if not stopping.
+                if stop.wait(1.0):
+                    return
+                try:
+                    device._reconnect()
+                except OSError:
+                    pass
+                continue
         elif not on:
             try:
                 device.turn_off()
@@ -327,7 +334,7 @@ def main() -> None:
     finally:
         stop.set()
         for t in threads:
-            t.join()
+            t.join(timeout=7.0)
         for d in devices:
             try:
                 d.turn_off()
