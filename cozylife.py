@@ -22,7 +22,6 @@ import concurrent.futures
 import json
 import re
 import socket
-import struct
 import subprocess
 import time
 from typing import Optional
@@ -52,15 +51,38 @@ class CozyLifeDevice:
     def _connect(self) -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(5)
-        # SO_LINGER l_onoff=1 l_linger=0: close() sends RST immediately
-        # rather than lingering, so the device sees the drop even if we die hard.
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        # Keepalives: OS probes after 10 s idle, every 3 s, gives up after 3 misses.
+        # Without this, a silently-dropped connection isn't detected for minutes and
+        # send() eventually blocks waiting for ACKs, freezing the caller.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        _ka = getattr(socket, "TCP_KEEPALIVE", getattr(socket, "TCP_KEEPIDLE", None))
+        if _ka:
+            s.setsockopt(socket.IPPROTO_TCP, _ka, 10)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
         s.connect((self.ip, _PORT))
         self._sock = s
 
+    def reconnect(self) -> None:
+        """Close and reopen the TCP connection."""
+        self.close()
+        self._connect()
+
     def close(self) -> None:
-        """Close the TCP connection."""
+        """Close the TCP connection with a proper FIN teardown.
+
+        shutdown(SHUT_WR) flushes the send buffer and delivers a FIN to the
+        device before close().  This lets the device release its connection
+        slot immediately.  A raw close() with SO_LINGER=0 (RST) can leave
+        device firmware in a stuck state that blocks rediscovery.
+        """
         if self._sock:
+            try:
+                self._sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
             try:
                 self._sock.close()
             except OSError:
@@ -92,6 +114,26 @@ class CozyLifeDevice:
         else:
             raise ValueError(f"Unknown command: {command}")
         return (json.dumps(msg, separators=(",", ":")) + "\r\n").encode()
+
+    def _drain(self) -> None:
+        """Discard queued device responses to prevent recv-buffer overflow.
+
+        The device ACKs every SET command with a small JSON packet.  If the
+        caller never reads these, the kernel recv buffer fills over several
+        minutes, TCP flow-control backs up the device's send side, and
+        eventually send() blocks until the connection times out.  Call this
+        after any fire-and-forget _send() to keep the pipe clear.
+        """
+        if self._sock is None:
+            return
+        try:
+            self._sock.setblocking(False)
+            while self._sock.recv(4096):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+        finally:
+            self._sock.settimeout(5)
 
     def _send(self, command: int, payload: Optional[dict] = None) -> None:
         if self._sock is None:
