@@ -2,11 +2,16 @@
 master.py — interactive TUI master control for CozyLife lights.
 
 Keys:
-  1 / 2 / 3 / 4   switch mode: OFF / DISCO / AUDIO / MANUAL
-  ↑ / ↓            navigate settings
-  ← / →            decrease / increase selected setting value
-  r                rediscover devices
-  q                quit
+  1 / 2 / 3 / 4 / 5   switch mode: OFF / DISCO / AUDIO / MANUAL / MUSIC
+  ↑ / ↓                navigate settings
+  ← / →                decrease / increase selected setting value
+  r                    rediscover devices
+  q                    quit
+
+Modes
+-----
+  AUDIO  — reacts to the microphone (ambient sound in the room)
+  MUSIC  — reacts to the speaker output (music/media playing on this PC)
 
 Usage:
   python master.py                          # auto-discover
@@ -15,6 +20,7 @@ Usage:
 
 import curses
 import math
+import platform
 import random
 import sys
 import threading
@@ -29,6 +35,63 @@ try:
     AUDIO_AVAILABLE = True
 except ImportError:
     AUDIO_AVAILABLE = False
+
+# macOS virtual-audio driver names recognised as loopback sources
+_MACOS_LOOPBACK_NAMES = ["BlackHole", "Soundflower", "Loopback", "VB-Audio"]
+
+
+def _find_loopback_device() -> tuple[int | None, int | None]:
+    """Return (device_index, channel_count) for the system-audio loopback source."""
+    if not AUDIO_AVAILABLE:
+        return None, None
+    system = platform.system()
+    devices = sd.query_devices()
+
+    if system == "Linux":
+        try:
+            default_out = sd.query_devices(kind="output")
+            monitor_name = default_out["name"] + ".monitor"
+            for i, d in enumerate(devices):
+                if d["name"] == monitor_name and d["max_input_channels"] > 0:
+                    return i, d["max_input_channels"]
+        except Exception:
+            pass
+        for i, d in enumerate(devices):
+            if "monitor" in d["name"].lower() and d["max_input_channels"] > 0:
+                return i, d["max_input_channels"]
+
+    elif system == "Darwin":
+        for name in _MACOS_LOOPBACK_NAMES:
+            for i, d in enumerate(devices):
+                if name.lower() in d["name"].lower() and d["max_input_channels"] > 0:
+                    return i, d["max_input_channels"]
+
+    elif system == "Windows":
+        try:
+            default_out = sd.query_devices(kind="output")
+            out_idx = int(sd.default.device[1])
+            return out_idx, default_out["max_output_channels"]
+        except Exception:
+            pass
+
+    return None, None
+
+
+def _open_loopback_stream(device_idx: int | None, channels: int, callback) -> "sd.InputStream":
+    kwargs: dict = dict(
+        samplerate=44100,
+        blocksize=2048,
+        channels=min(channels, 2),
+        callback=callback,
+    )
+    if device_idx is not None:
+        kwargs["device"] = device_idx
+    if platform.system() == "Windows":
+        try:
+            kwargs["extra_settings"] = sd.WasapiSettings(loopback=True)
+        except AttributeError:
+            pass
+    return sd.InputStream(**kwargs)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -51,6 +114,16 @@ SETTINGS_META: dict[str, list[dict]] = {
         {"key": "light_interval", "label": "Update Rate", "min": 0.02, "max": 0.5,    "step": 0.01,  "fmt": "{:.2f}s"},
         {"key": "hue_spread",     "label": "Hue Spread",  "min": 0.0,  "max": 180.0,  "step": 5.0,   "fmt": "{:.0f}°"},
     ],
+    # Music mode shares the same DSP knobs as audio mode but reads from the
+    # speaker loopback instead of the microphone.
+    "music": [
+        {"key": "smoothing",      "label": "Smoothing",   "min": 0.01, "max": 0.99,   "step": 0.05,  "fmt": "{:.2f}"},
+        {"key": "gain_decay",     "label": "Gain Decay",  "min": 0.90, "max": 0.999,  "step": 0.001, "fmt": "{:.3f}"},
+        {"key": "freq_min",       "label": "Freq Min",    "min": 20.0, "max": 500.0,  "step": 10.0,  "fmt": "{:.0f} Hz"},
+        {"key": "freq_max",       "label": "Freq Max",    "min": 1000.,"max": 20000., "step": 500.0, "fmt": "{:.0f} Hz"},
+        {"key": "light_interval", "label": "Update Rate", "min": 0.02, "max": 0.5,    "step": 0.01,  "fmt": "{:.2f}s"},
+        {"key": "hue_spread",     "label": "Hue Spread",  "min": 0.0,  "max": 180.0,  "step": 5.0,   "fmt": "{:.0f}°"},
+    ],
     "manual": [
         {"key": "hue",        "label": "Hue",        "min": 0.0,   "max": 360.0, "step": 2.0,  "fmt": "{:.0f}°"},
         {"key": "saturation", "label": "Saturation", "min": 0.0,   "max": 100.0, "step": 2.0,  "fmt": "{:.0f}%"},
@@ -66,6 +139,8 @@ DEFAULT_SETTINGS: dict[str, dict] = {
     "disco":  {"interval": 0.05, "sat_min": 60.0, "sat_max": 100.0, "bri": 255.0},
     "audio":  {"smoothing": 0.25, "gain_decay": 0.995,
                "freq_min": 80.0, "freq_max": 8000.0, "light_interval": 0.05, "hue_spread": 0.0},
+    "music":  {"smoothing": 0.20, "gain_decay": 0.995,
+               "freq_min": 60.0, "freq_max": 8000.0, "light_interval": 0.05, "hue_spread": 0.0},
     "manual": {"hue": 0.0, "saturation": 90.0, "brightness": 200.0,
                "color_temp": 3500.0, "use_temp": 0.0},
 }
@@ -86,12 +161,15 @@ class Controller:
         self.status   = f"{len(devices)} device(s) connected"
         self.lock     = threading.Lock()
 
-        # audio reactive state (written by audio callback, read by workers)
+        # reactive state shared between audio/music callback and light workers
         self._a_hue   = 0.0
         self._a_bri   = 0
         self._a_sat   = 90.0
         self._a_peak  = 0.01
         self._a_stream: Optional[object] = None
+        # music-mode loopback device (detected once, reused on mode switches)
+        self._music_dev_idx: Optional[int] = None
+        self._music_channels: int = 1
 
         self._stop    = threading.Event()
         self._workers: list[threading.Thread] = []
@@ -99,9 +177,20 @@ class Controller:
     # ── mode switching ────────────────────────────────────────────────────────
 
     def set_mode(self, mode: str) -> None:
-        if mode == "audio" and not AUDIO_AVAILABLE:
+        if mode in ("audio", "music") and not AUDIO_AVAILABLE:
             self.status = "audio unavailable — pip install sounddevice numpy"
             return
+
+        if mode == "music":
+            # Detect the loopback device once; cache for future switches.
+            if self._music_dev_idx is None:
+                dev_idx, channels = _find_loopback_device()
+                if dev_idx is None:
+                    self.status = ("music: no loopback device found — "
+                                   "see music_lights.py --list-audio")
+                    return
+                self._music_dev_idx = dev_idx
+                self._music_channels = channels or 2
 
         self._stop_workers()
         self.mode = mode
@@ -122,7 +211,7 @@ class Controller:
                     pass
             self._push_manual()
 
-        else:  # disco / audio
+        else:  # disco / audio / music
             self._stop.clear()
             for idx, d in enumerate(self.devices):
                 t = threading.Thread(target=self._worker, args=(d, idx), daemon=True)
@@ -130,6 +219,8 @@ class Controller:
                 self._workers.append(t)
             if mode == "audio":
                 self._start_audio()
+            elif mode == "music":
+                self._start_music()
 
         self.status = f"Mode: {mode.upper()}"
 
@@ -143,7 +234,8 @@ class Controller:
             self._a_stream = None
         self._stop.set()
         for t in self._workers:
-            t.join(timeout=6.0)  # must exceed socket send timeout (5s)
+            # Allow up to 7 s: socket timeout (5 s) + reconnect overhead (2 s).
+            t.join(timeout=7.0)
         self._workers.clear()
 
     # ── per-device workers ────────────────────────────────────────────────────
@@ -161,7 +253,7 @@ class Controller:
                                      "5": int(hue), "6": int(sat * 10)})
                     self._stop.wait(s.get("interval", 0.05))
 
-                elif mode == "audio":
+                elif mode in ("audio", "music"):
                     with self.lock:
                         h, b, sat = self._a_hue, self._a_bri, self._a_sat
                     h = (h + idx * s.get("hue_spread", 0.0)) % 360
@@ -171,7 +263,15 @@ class Controller:
                     self._stop.wait(s.get("light_interval", 0.05))
 
             except OSError:
-                self._stop.wait(1.0)
+                device.close()
+                # Wait briefly (honouring stop), then attempt a reconnect so
+                # the worker recovers automatically if the device comes back.
+                if self._stop.wait(1.0):
+                    return
+                try:
+                    device._reconnect()
+                except OSError:
+                    pass  # next iteration will retry
 
     # ── audio ─────────────────────────────────────────────────────────────────
 
@@ -199,6 +299,35 @@ class Controller:
         self._a_peak = 0.01
         stream = sd.InputStream(samplerate=44100, blocksize=1024,
                                 channels=1, callback=self._audio_callback)
+        stream.start()
+        self._a_stream = stream
+
+    def _music_callback(self, indata, frames, time_info, status) -> None:
+        """Same DSP as _audio_callback but called from the loopback stream."""
+        mono = indata.mean(axis=1) if indata.ndim > 1 and indata.shape[1] > 1 else indata[:, 0]
+        s    = self.settings["music"]
+        rms  = float(np.sqrt(np.mean(mono ** 2)))
+        self._a_peak = max(rms, self._a_peak * s["gain_decay"], 0.001)
+        vol  = min(rms / self._a_peak, 1.0)
+
+        win   = np.hanning(len(mono))
+        spec  = np.abs(np.fft.rfft(mono * win))
+        freqs = np.fft.rfftfreq(len(mono), 1.0 / 44100)
+        fmin, fmax = s["freq_min"], s["freq_max"]
+        mask  = (freqs >= fmin) & (freqs <= fmax)
+        dom   = float(freqs[mask][np.argmax(spec[mask])]) if mask.any() else fmin
+        t     = (math.log(max(dom, fmin)) - math.log(fmin)) / (math.log(fmax) - math.log(fmin))
+        sm    = s["smoothing"]
+
+        with self.lock:
+            self._a_hue = self._a_hue + sm * (t * 360.0 - self._a_hue)
+            self._a_bri = int(self._a_bri + sm * (vol * 255 - self._a_bri))
+
+    def _start_music(self) -> None:
+        self._a_peak = 0.001
+        stream = _open_loopback_stream(
+            self._music_dev_idx, self._music_channels, self._music_callback
+        )
         stream.start()
         self._a_stream = stream
 
@@ -295,10 +424,11 @@ def draw(stdscr, ctrl: Controller) -> None:
         ("disco",  "2", " DISCO  "),
         ("audio",  "3", " AUDIO  "),
         ("manual", "4", " MANUAL "),
+        ("music",  "5", " MUSIC  "),
     ]
     x = 2
     for mkey, num, label in mode_defs:
-        unavail = mkey == "audio" and not AUDIO_AVAILABLE
+        unavail = mkey in ("audio", "music") and not AUDIO_AVAILABLE
         if unavail:
             attr = C_DIM
         elif mkey == ctrl.mode:
@@ -339,10 +469,11 @@ def draw(stdscr, ctrl: Controller) -> None:
         put(r, 2, "All lights off." if ctrl.mode == "off" else "No settings.", C_DIM)
         r += 1
 
-    # audio live meters
-    if ctrl.mode == "audio" and AUDIO_AVAILABLE:
+    # live reactive meters (audio and music modes)
+    if ctrl.mode in ("audio", "music") and AUDIO_AVAILABLE:
         r += 1
-        put(r, 2, "Live audio:", curses.A_BOLD)
+        src_label = "microphone" if ctrl.mode == "audio" else "speaker output"
+        put(r, 2, f"Live ({src_label}):", curses.A_BOLD)
         r += 1
         with ctrl.lock:
             ah, ab = ctrl._a_hue, ctrl._a_bri
@@ -376,7 +507,7 @@ def draw(stdscr, ctrl: Controller) -> None:
     if help_row > r:
         put(help_row, 0, "─" * (cols - 1), C_DIM)
         put(help_row + 1, 0,
-            "  ↑/↓ navigate   ←/→ adjust   1-4 switch mode   r rediscover   q/Esc quit",
+            "  ↑/↓ navigate   ←/→ adjust   1-5 switch mode   r rediscover   q/Esc quit",
             C_DIM)
 
     stdscr.refresh()
@@ -416,6 +547,8 @@ def _run(stdscr, devices: list[CozyLifeDevice]) -> None:
                 ctrl.set_mode("audio")
             elif key == ord("4"):
                 ctrl.set_mode("manual")
+            elif key == ord("5"):
+                ctrl.set_mode("music")
             elif key == curses.KEY_UP:
                 ctrl.nav(-1)
             elif key == curses.KEY_DOWN:

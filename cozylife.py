@@ -55,6 +55,16 @@ class CozyLifeDevice:
         # SO_LINGER l_onoff=1 l_linger=0: close() sends RST immediately
         # rather than lingering, so the device sees the drop even if we die hard.
         s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        # TCP keepalives so the OS detects dead connections and the device
+        # doesn't hold a zombie session that blocks re-connection.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        try:
+            # Linux: start keepalives after 10 s idle, probe every 5 s, drop after 3 misses
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE,  10)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL,  5)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT,    3)
+        except AttributeError:
+            pass  # not available on all platforms; SO_KEEPALIVE alone still helps
         s.connect((self.ip, _PORT))
         self._sock = s
 
@@ -93,10 +103,20 @@ class CozyLifeDevice:
             raise ValueError(f"Unknown command: {command}")
         return (json.dumps(msg, separators=(",", ":")) + "\r\n").encode()
 
+    def _reconnect(self) -> None:
+        """Close any broken socket and open a fresh connection."""
+        self.close()
+        self._connect()
+
     def _send(self, command: int, payload: Optional[dict] = None) -> None:
         if self._sock is None:
-            raise OSError("not connected")
-        self._sock.send(self._build(command, payload or {}))
+            self._connect()
+        try:
+            self._sock.send(self._build(command, payload or {}))
+        except OSError:
+            # Socket is dead — close it so the caller can reconnect.
+            self.close()
+            raise
 
     def _send_recv(self, command: int, payload: Optional[dict] = None) -> dict:
         packet = self._build(command, payload or {})
