@@ -22,7 +22,6 @@ import concurrent.futures
 import json
 import re
 import socket
-import struct
 import subprocess
 import time
 from typing import Optional
@@ -52,15 +51,50 @@ class CozyLifeDevice:
     def _connect(self) -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(5)
-        # SO_LINGER l_onoff=1 l_linger=0: close() sends RST immediately
-        # rather than lingering, so the device sees the drop even if we die hard.
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        # Keepalives: OS probes after 10 s idle, every 3 s, gives up after 3 misses.
+        # Without this, a silently-dropped connection isn't detected for minutes and
+        # send() eventually blocks waiting for ACKs, freezing the caller.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        _ka = getattr(socket, "TCP_KEEPALIVE", getattr(socket, "TCP_KEEPIDLE", None))
+        if _ka:
+            s.setsockopt(socket.IPPROTO_TCP, _ka, 10)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
         s.connect((self.ip, _PORT))
         self._sock = s
 
+    def reconnect(self) -> None:
+        """Close and reopen the TCP connection."""
+        self.close()
+        self._connect()
+
     def close(self) -> None:
-        """Close the TCP connection."""
+        """Close the TCP connection with a full 4-way FIN handshake.
+
+        Sequence:
+          1. shutdown(SHUT_WR)  — sends our FIN; TCP guarantees any buffered
+             data (e.g. turn_off) is delivered before the FIN.
+          2. recv loop (1 s timeout) — drains remaining device responses and
+             waits for the device's own FIN (recv returns b"").  This ACKs
+             the device's FIN and lets it reach CLOSED before we leave.
+          3. close() — releases the fd.
+
+        Skipping step 2 leaves the device in LAST_ACK waiting for our final
+        ACK indefinitely, which blocks it from accepting new connections.
+        """
         if self._sock:
+            try:
+                self._sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            try:
+                self._sock.settimeout(1.0)
+                while self._sock.recv(4096):
+                    pass
+            except OSError:
+                pass
             try:
                 self._sock.close()
             except OSError:
@@ -92,6 +126,26 @@ class CozyLifeDevice:
         else:
             raise ValueError(f"Unknown command: {command}")
         return (json.dumps(msg, separators=(",", ":")) + "\r\n").encode()
+
+    def _drain(self) -> None:
+        """Discard queued device responses to prevent recv-buffer overflow.
+
+        The device ACKs every SET command with a small JSON packet.  If the
+        caller never reads these, the kernel recv buffer fills over several
+        minutes, TCP flow-control backs up the device's send side, and
+        eventually send() blocks until the connection times out.  Call this
+        after any fire-and-forget _send() to keep the pipe clear.
+        """
+        if self._sock is None:
+            return
+        try:
+            self._sock.setblocking(False)
+            while self._sock.recv(4096):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+        finally:
+            self._sock.settimeout(5)
 
     def _send(self, command: int, payload: Optional[dict] = None) -> None:
         if self._sock is None:
@@ -192,15 +246,23 @@ class CozyLifeDevice:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind((local_ip, 0))
-                s.settimeout(0.2)
-                for _ in range(3):
-                    s.sendto(probe, (_DISCOVERY_ADDR, _DISCOVERY_PORT))
+                s.settimeout(0.1)
                 socks.append(s)
             except OSError:
                 pass
 
-        deadline = time.time() + timeout
+        # Re-broadcast every 0.4 s so devices that were briefly busy on the
+        # first burst still get a probe during the listen window.
+        deadline    = time.time() + timeout
+        next_probe  = 0.0
         while time.time() < deadline:
+            if time.time() >= next_probe:
+                for s in socks:
+                    try:
+                        s.sendto(probe, (_DISCOVERY_ADDR, _DISCOVERY_PORT))
+                    except OSError:
+                        pass
+                next_probe = time.time() + 0.4
             for s in socks:
                 try:
                     _, addr = s.recvfrom(1024)

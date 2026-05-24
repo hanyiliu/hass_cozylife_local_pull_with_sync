@@ -16,10 +16,20 @@ Usage:
 import curses
 import math
 import random
+import socket
 import sys
 import threading
 import time
 from typing import Optional
+
+try:
+    import fcntl as _fcntl
+    import struct as _struct
+    import termios as _termios
+    _FIONREAD = getattr(_termios, "FIONREAD", 0x4004667F)
+    _HAS_FIONREAD = True
+except ImportError:
+    _HAS_FIONREAD = False
 
 from cozylife import CozyLifeDevice
 
@@ -72,6 +82,33 @@ DEFAULT_SETTINGS: dict[str, dict] = {
 
 BAR_W = 14
 
+_DBG_EMPTY = {
+    "recv_pending": -1,
+    "recv_buf":     -1,
+    "send_buf":     -1,
+    "cmd_rate":      0.0,
+    "total_cmds":    0,
+}
+
+
+def _sock_stats(sock) -> dict:
+    """Read kernel-level TCP buffer metrics for a connected socket."""
+    out = {"recv_pending": -1, "recv_buf": -1, "send_buf": -1}
+    if sock is None:
+        return out
+    try:
+        out["recv_buf"] = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        out["send_buf"] = sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+    except OSError:
+        pass
+    if _HAS_FIONREAD:
+        try:
+            raw = _fcntl.ioctl(sock.fileno(), _FIONREAD, _struct.pack("I", 0))
+            out["recv_pending"] = _struct.unpack("I", raw)[0]
+        except OSError:
+            pass
+    return out
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Controller
@@ -95,6 +132,9 @@ class Controller:
 
         self._stop    = threading.Event()
         self._workers: list[threading.Thread] = []
+
+        self.debug = False
+        self._dbg: list[dict] = [dict(_DBG_EMPTY) for _ in devices]
 
     # ── mode switching ────────────────────────────────────────────────────────
 
@@ -149,9 +189,14 @@ class Controller:
     # ── per-device workers ────────────────────────────────────────────────────
 
     def _worker(self, device: CozyLifeDevice, idx: int = 0) -> None:
+        cmd_count  = 0
+        total_cmds = 0
+        rate_t     = time.monotonic()
+
         while not self._stop.is_set():
             mode = self.mode
             s    = self.settings.get(mode, {})
+            sent = False
             try:
                 if mode == "disco":
                     hue = random.uniform(0, 360)
@@ -159,6 +204,8 @@ class Controller:
                     bri = round(int(s.get("bri", 255)) * 1000 / 255)
                     device._send(3, {"1": 255, "4": bri,
                                      "5": int(hue), "6": int(sat * 10)})
+                    device._drain()
+                    sent = True
                     self._stop.wait(s.get("interval", 0.05))
 
                 elif mode == "audio":
@@ -168,32 +215,64 @@ class Controller:
                     if b > 5:
                         device._send(3, {"1": 255, "4": round(b * 1000 / 255),
                                          "5": int(h), "6": int(sat * 10)})
+                        device._drain()
+                        sent = True
                     self._stop.wait(s.get("light_interval", 0.05))
 
             except OSError:
-                self._stop.wait(1.0)
+                if self._stop.is_set():
+                    return
+                self.status = f"Lost {device.ip} — reconnecting..."
+                try:
+                    device.reconnect()
+                    self.status = f"Reconnected {device.ip}"
+                except OSError:
+                    self._stop.wait(5.0)
+
+            if sent:
+                cmd_count  += 1
+                total_cmds += 1
+
+            # Refresh debug stats every 0.5 s regardless of send rate
+            now = time.monotonic()
+            elapsed = now - rate_t
+            if elapsed >= 0.5:
+                rate = cmd_count / elapsed
+                cmd_count = 0
+                rate_t    = now
+                stats = _sock_stats(device._sock)
+                stats["cmd_rate"]   = rate
+                stats["total_cmds"] = total_cmds
+                if idx < len(self._dbg):
+                    self._dbg[idx] = stats
 
     # ── audio ─────────────────────────────────────────────────────────────────
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
-        mono = indata[:, 0]
-        s    = self.settings["audio"]
-        rms  = float(np.sqrt(np.mean(mono ** 2)))
-        self._a_peak = max(rms, self._a_peak * s["gain_decay"], 0.01)
-        vol  = min(rms / self._a_peak, 1.0)
+        # Exceptions raised here are caught by sounddevice and cause it to abort
+        # the stream, after which stream.stop() blocks indefinitely — freezing the
+        # terminal. Swallow all errors so the stream stays alive.
+        try:
+            mono = indata[:, 0]
+            s    = self.settings["audio"]
+            rms  = float(np.sqrt(np.mean(mono ** 2)))
+            self._a_peak = max(rms, self._a_peak * s["gain_decay"], 0.01)
+            vol  = min(rms / self._a_peak, 1.0)
 
-        win   = np.hanning(len(mono))
-        spec  = np.abs(np.fft.rfft(mono * win))
-        freqs = np.fft.rfftfreq(len(mono), 1.0 / 44100)
-        fmin, fmax = s["freq_min"], s["freq_max"]
-        mask  = (freqs >= fmin) & (freqs <= fmax)
-        dom   = float(freqs[mask][np.argmax(spec[mask])]) if mask.any() else fmin
-        t     = (math.log(max(dom, fmin)) - math.log(fmin)) / (math.log(fmax) - math.log(fmin))
-        sm    = s["smoothing"]
+            win   = np.hanning(len(mono))
+            spec  = np.abs(np.fft.rfft(mono * win))
+            freqs = np.fft.rfftfreq(len(mono), 1.0 / 44100)
+            fmin, fmax = s["freq_min"], s["freq_max"]
+            mask  = (freqs >= fmin) & (freqs <= fmax)
+            dom   = float(freqs[mask][np.argmax(spec[mask])]) if mask.any() else fmin
+            t     = (math.log(max(dom, fmin)) - math.log(fmin)) / (math.log(fmax) - math.log(fmin))
+            sm    = s["smoothing"]
 
-        with self.lock:
-            self._a_hue = self._a_hue + sm * (t * 360.0 - self._a_hue)
-            self._a_bri = int(self._a_bri + sm * (vol * 255 - self._a_bri))
+            with self.lock:
+                self._a_hue = self._a_hue + sm * (t * 360.0 - self._a_hue)
+                self._a_bri = int(self._a_bri + sm * (vol * 255 - self._a_bri))
+        except Exception:
+            pass
 
     def _start_audio(self) -> None:
         self._a_peak = 0.01
@@ -241,12 +320,22 @@ class Controller:
 
     def shutdown(self) -> None:
         self._stop_workers()
-        for d in self.devices:
+        # Close all devices in parallel — close() waits up to 1 s for device
+        # FIN so serial shutdown of N devices would take N seconds.
+        def _close_one(d: CozyLifeDevice) -> None:
             try:
                 d.turn_off()
                 d.close()
             except OSError:
                 pass
+        threads = [
+            threading.Thread(target=_close_one, args=(d,), daemon=True)
+            for d in self.devices
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=3.0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -366,6 +455,40 @@ def draw(stdscr, ctrl: Controller) -> None:
         put(r, 4, f"● {d.ip}", C_DEV)
         r += 1
 
+    # debug panel
+    if ctrl.debug:
+        r += 1
+        put(r, 2, "Debug — TCP Buffer Stats  [d to hide]", curses.A_BOLD)
+        r += 1
+        fionread_note = "" if _HAS_FIONREAD else "  (FIONREAD unavailable — recv_pending always -1)"
+        if fionread_note:
+            put(r, 4, fionread_note, C_DIM)
+            r += 1
+        for i, (d, dbg) in enumerate(zip(ctrl.devices, ctrl._dbg)):
+            rp = dbg.get("recv_pending", -1)
+            rb = dbg.get("recv_buf",     -1)
+            sb = dbg.get("send_buf",     -1)
+            cr = dbg.get("cmd_rate",    0.0)
+            tc = dbg.get("total_cmds",    0)
+
+            put(r, 4, f"● {d.ip}", C_DEV)
+            r += 1
+
+            if rp >= 0 and rb > 0:
+                fill_bar = _bar(rp, 0, rb, 16)
+                pct      = rp / rb * 100
+                recv_str = f"recv pending: {rp:>6} / {rb} B  [{fill_bar}] {pct:4.1f}%"
+            elif rp >= 0:
+                recv_str = f"recv pending: {rp} B  (buf size unknown)"
+            else:
+                recv_str = "recv pending: n/a"
+            put(r, 6, recv_str, C_DIM)
+            r += 1
+
+            send_str = f"send buf cap: {sb} B" if sb >= 0 else "send buf cap: n/a"
+            put(r, 6, f"{send_str}   rate: {cr:5.1f} cmd/s   total: {tc}", C_DIM)
+            r += 1
+
     # status
     if ctrl.status:
         r += 1
@@ -376,7 +499,7 @@ def draw(stdscr, ctrl: Controller) -> None:
     if help_row > r:
         put(help_row, 0, "─" * (cols - 1), C_DIM)
         put(help_row + 1, 0,
-            "  ↑/↓ navigate   ←/→ adjust   1-4 switch mode   r rediscover   q/Esc quit",
+            "  ↑/↓ navigate   ←/→ adjust   1-4 mode   r rediscover   d debug   q/Esc quit",
             C_DIM)
 
     stdscr.refresh()
@@ -424,6 +547,8 @@ def _run(stdscr, devices: list[CozyLifeDevice]) -> None:
                 ctrl.adjust(-1)
             elif key == curses.KEY_RIGHT:
                 ctrl.adjust(1)
+            elif key == ord("d"):
+                ctrl.debug = not ctrl.debug
             elif key == ord("r"):
                 ctrl.status = "Rediscovering..."
                 draw(stdscr, ctrl)
