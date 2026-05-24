@@ -71,16 +71,28 @@ class CozyLifeDevice:
         self._connect()
 
     def close(self) -> None:
-        """Close the TCP connection with a proper FIN teardown.
+        """Close the TCP connection with a full 4-way FIN handshake.
 
-        shutdown(SHUT_WR) flushes the send buffer and delivers a FIN to the
-        device before close().  This lets the device release its connection
-        slot immediately.  A raw close() with SO_LINGER=0 (RST) can leave
-        device firmware in a stuck state that blocks rediscovery.
+        Sequence:
+          1. shutdown(SHUT_WR)  — sends our FIN; TCP guarantees any buffered
+             data (e.g. turn_off) is delivered before the FIN.
+          2. recv loop (1 s timeout) — drains remaining device responses and
+             waits for the device's own FIN (recv returns b"").  This ACKs
+             the device's FIN and lets it reach CLOSED before we leave.
+          3. close() — releases the fd.
+
+        Skipping step 2 leaves the device in LAST_ACK waiting for our final
+        ACK indefinitely, which blocks it from accepting new connections.
         """
         if self._sock:
             try:
                 self._sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            try:
+                self._sock.settimeout(1.0)
+                while self._sock.recv(4096):
+                    pass
             except OSError:
                 pass
             try:
@@ -234,15 +246,23 @@ class CozyLifeDevice:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind((local_ip, 0))
-                s.settimeout(0.2)
-                for _ in range(3):
-                    s.sendto(probe, (_DISCOVERY_ADDR, _DISCOVERY_PORT))
+                s.settimeout(0.1)
                 socks.append(s)
             except OSError:
                 pass
 
-        deadline = time.time() + timeout
+        # Re-broadcast every 0.4 s so devices that were briefly busy on the
+        # first burst still get a probe during the listen window.
+        deadline    = time.time() + timeout
+        next_probe  = 0.0
         while time.time() < deadline:
+            if time.time() >= next_probe:
+                for s in socks:
+                    try:
+                        s.sendto(probe, (_DISCOVERY_ADDR, _DISCOVERY_PORT))
+                    except OSError:
+                        pass
+                next_probe = time.time() + 0.4
             for s in socks:
                 try:
                     _, addr = s.recvfrom(1024)

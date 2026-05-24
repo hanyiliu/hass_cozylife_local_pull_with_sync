@@ -320,12 +320,22 @@ class Controller:
 
     def shutdown(self) -> None:
         self._stop_workers()
-        for d in self.devices:
+        # Close all devices in parallel — close() waits up to 1 s for device
+        # FIN so serial shutdown of N devices would take N seconds.
+        def _close_one(d: CozyLifeDevice) -> None:
             try:
                 d.turn_off()
                 d.close()
             except OSError:
                 pass
+        threads = [
+            threading.Thread(target=_close_one, args=(d,), daemon=True)
+            for d in self.devices
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=3.0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
