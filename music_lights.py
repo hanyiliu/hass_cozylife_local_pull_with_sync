@@ -28,6 +28,8 @@ Usage
     python music_lights.py --audio-device 3          # force a specific device ID
 """
 
+from __future__ import annotations
+
 import math
 import platform
 import sys
@@ -186,30 +188,35 @@ def _freq_to_hue(freq: float) -> float:
 def _audio_callback(indata, frames, time_info, status):
     global _hue, _sat, _bri, _peak_rms
 
-    # Mix to mono (average channels)
-    mono = indata.mean(axis=1) if indata.ndim > 1 else indata[:, 0]
+    # An exception here makes sounddevice abort the stream, after which
+    # stream.stop() blocks forever and freezes the terminal — swallow errors.
+    try:
+        # Mix to mono (average channels)
+        mono = indata.mean(axis=1)
 
-    rms = float(np.sqrt(np.mean(mono ** 2)))
-    _peak_rms = max(rms, _peak_rms * GAIN_DECAY, MIN_GAIN)
-    volume = min(rms / _peak_rms, 1.0)
+        rms = float(np.sqrt(np.mean(mono ** 2)))
+        _peak_rms = max(rms, _peak_rms * GAIN_DECAY, MIN_GAIN)
+        volume = min(rms / _peak_rms, 1.0)
 
-    window   = np.hanning(len(mono))
-    spectrum = np.abs(np.fft.rfft(mono * window))
-    freqs    = np.fft.rfftfreq(len(mono), 1.0 / SAMPLE_RATE)
+        window   = np.hanning(len(mono))
+        spectrum = np.abs(np.fft.rfft(mono * window))
+        freqs    = np.fft.rfftfreq(len(mono), 1.0 / SAMPLE_RATE)
 
-    mask = (freqs >= FREQ_MIN) & (freqs <= FREQ_MAX)
-    if mask.any():
-        dominant_freq = float(freqs[mask][np.argmax(spectrum[mask])])
-    else:
-        dominant_freq = FREQ_MIN
+        mask = (freqs >= FREQ_MIN) & (freqs <= FREQ_MAX)
+        if mask.any():
+            dominant_freq = float(freqs[mask][np.argmax(spectrum[mask])])
+        else:
+            dominant_freq = FREQ_MIN
 
-    target_hue = _freq_to_hue(dominant_freq)
-    target_bri = int(volume * 255)
+        target_hue = _freq_to_hue(dominant_freq)
+        target_bri = int(volume * 255)
 
-    with _lock:
-        _hue = _hue + SMOOTHING * (target_hue - _hue)
-        _bri = int(_bri + SMOOTHING * (target_bri - _bri))
-        _sat = 90.0
+        with _lock:
+            _hue = _hue + SMOOTHING * (target_hue - _hue)
+            _bri = int(_bri + SMOOTHING * (target_bri - _bri))
+            _sat = 90.0
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------
@@ -232,12 +239,13 @@ def _light_worker(device: CozyLifeDevice, stop: threading.Event) -> None:
                     "5": int(h),
                     "6": int(s * 10),
                 })
+                device._drain()
             except OSError:
-                # Socket closed by _send — wait, then reconnect if not stopping.
+                # Connection dropped — wait, then reconnect if not stopping.
                 if stop.wait(1.0):
                     return
                 try:
-                    device._reconnect()
+                    device.reconnect()
                 except OSError:
                     pass
                 continue
