@@ -57,6 +57,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install numpy sounddevice                         # audio + music modes
 pip install tinytuya tuya-device-sharing-sdk segno    # Tuya / Smart Life bulbs
+pip install pyobjc-framework-CoreAudio                # macOS: hear the Mac's own output
 ```
 
 **2. Fetch your Tuya bulbs' keys** (once, and again if you add bulbs)
@@ -70,9 +71,20 @@ python tuya_keys.py <user code>
 Scan the QR code it shows with the Smart Life app and approve. This writes
 `devices.json`. Skip this step if you only have CozyLife lights.
 
-**3. Route your speaker audio for music mode** (macOS, once)
+**3. Let music mode hear your Mac** (macOS, once)
 
-Music mode listens to what your Mac is playing through a loopback driver:
+On macOS 14.2 or later there's nothing extra to install: MUSIC and RAVE can
+listen to everything the Mac plays through the **Mac System Audio** Source (the
+default when no loopback driver is installed), and sound keeps playing as
+normal. The first time, macOS asks to let your terminal record system audio —
+allow it, or turn it on under System Settings → Privacy & Security → Screen &
+System Audio Recording → System Audio Recording Only. Check it while music plays:
+
+```bash
+python mac_system_audio.py
+```
+
+On older macOS, route audio through a loopback driver instead:
 
 1. `brew install blackhole-2ch` (or the installer from [BlackHole](https://github.com/ExistentialAudio/BlackHole)), then restart.
 2. In Audio MIDI Setup, click **+** → **Create Multi-Output Device**, and tick
@@ -120,10 +132,10 @@ python master.py 192.168.1.100 192.168.1.101 # specific CozyLife IPs (+ devices.
 | `q` / `Esc` | Quit and turn everything off |
 
 In AUDIO, MUSIC and RAVE, the first setting is **Source**: press `←` / `→` on it
-to switch which audio input the lights follow (Serato Virtual Audio, BlackHole, a
-microphone, …) without leaving the mode. MUSIC and RAVE start on the detected
-loopback device and AUDIO on the system's default input; each remembers its own
-choice.
+to switch which audio input the lights follow (Mac System Audio, Serato Virtual
+Audio, BlackHole, a microphone, …) without leaving the mode. MUSIC and RAVE start
+on the detected loopback device (Mac System Audio if there isn't one) and AUDIO
+on the system's default input; each remembers its own choice.
 Devices added while `master.py` is running show up the next time you switch
 into the mode.
 

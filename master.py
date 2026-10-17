@@ -12,7 +12,8 @@ Keys:
 Modes
 -----
   AUDIO  — reacts to the microphone (ambient sound in the room)
-  MUSIC  — reacts to the speaker output (music/media playing on this PC)
+  MUSIC  — reacts to the speaker output (music/media playing on this PC);
+           on macOS 14.2+ the "Mac System Audio" Source hears it without BlackHole
   RAVE   — flashes laser colours on the beat of the speaker output, dark
            between beats, off when the audio stops
 
@@ -45,6 +46,7 @@ except ImportError:
 
 from cozylife import CozyLifeDevice
 from tuya_light import TuyaLight, load_tuya_lights
+from mac_system_audio import AVAILABLE as SYSTEM_AUDIO_AVAILABLE, NAME as SYSTEM_AUDIO, SystemAudioTap
 
 try:
     import numpy as np
@@ -98,9 +100,9 @@ def _find_loopback_device() -> tuple[Optional[int], Optional[int]]:
 
 
 def _open_loopback_stream(device_idx: Optional[int], channels: int, callback,
-                          blocksize: int = 2048) -> "sd.InputStream":
+                          blocksize: int = 2048, samplerate: int = 44100) -> "sd.InputStream":
     kwargs: dict = dict(
-        samplerate=44100,
+        samplerate=samplerate,
         blocksize=blocksize,
         channels=min(channels, 2),
         callback=callback,
@@ -253,6 +255,9 @@ class Controller:
         self._a_sat   = 90.0
         self._a_peak  = 0.01
         self._a_stream: Optional[object] = None
+        self._sr      = 44100   # sample rate of the open stream
+        # everything the Mac plays (Core Audio tap), created when first picked
+        self._system_tap = SystemAudioTap() if SYSTEM_AUDIO_AVAILABLE else None
         # audio input each reactive mode listens to, by device name (indices
         # shift when devices come and go); None = not picked yet
         self.source: dict[str, Optional[str]] = {"audio": None, "music": None, "rave": None}
@@ -394,7 +399,7 @@ class Controller:
 
             win   = np.hanning(len(mono))
             spec  = np.abs(np.fft.rfft(mono * win))
-            freqs = np.fft.rfftfreq(len(mono), 1.0 / 44100)
+            freqs = np.fft.rfftfreq(len(mono), 1.0 / self._sr)
             fmin, fmax = s["freq_min"], s["freq_max"]
             mask  = (freqs >= fmin) & (freqs <= fmax)
             dom   = float(freqs[mask][np.argmax(spec[mask])]) if mask.any() else fmin
@@ -444,7 +449,7 @@ class Controller:
             loud = rms >= _RAVE_SILENCE_RMS
 
             spec  = np.abs(np.fft.rfft(mono * np.hanning(len(mono))))
-            freqs = np.fft.rfftfreq(len(mono), 1.0 / 44100)
+            freqs = np.fft.rfftfreq(len(mono), 1.0 / self._sr)
             band  = (freqs >= _RAVE_BASS[0]) & (freqs <= _RAVE_BASS[1])
             bass  = float(np.sum(spec[band] ** 2))
             avg   = self._r_bass_avg
@@ -473,15 +478,22 @@ class Controller:
             idx, ch = _find_loopback_device()
             if idx is not None and all(i != idx for i, _, _ in devs):
                 devs.insert(0, (idx, sd.query_devices(idx)["name"], ch or 2))
+        # Its device only exists once the tap is started, so list it up front
+        # (index -1) until then.
+        if self._system_tap and all(n != SYSTEM_AUDIO for _, n, _ in devs):
+            devs.insert(0, (-1, SYSTEM_AUDIO, 2))
         return devs
 
     @staticmethod
     def _default_source(mode: str) -> Optional[str]:
-        """Loopback device for MUSIC / RAVE, the system default input for AUDIO."""
+        """Loopback device for MUSIC / RAVE (else Mac System Audio), the system
+        default input for AUDIO."""
         try:
             if mode in ("music", "rave"):
                 idx, _ = _find_loopback_device()
-                return sd.query_devices(idx)["name"] if idx is not None else None
+                if idx is not None:
+                    return sd.query_devices(idx)["name"]
+                return SYSTEM_AUDIO if SYSTEM_AUDIO_AVAILABLE else None
             return sd.query_devices(kind="input")["name"]
         except Exception:
             return None
@@ -502,7 +514,14 @@ class Controller:
             self._a_bri = 0
             self._r_beat, self._r_beat_t, self._r_heard_t, self._r_bass_avg = 0, 0.0, 0.0, 0.0
         name = self.source[self.mode]
-        dev  = next(((i, ch) for i, n, ch in self._sources() if n == name), None)
+        if name == SYSTEM_AUDIO and self._system_tap and not self._system_tap.running:
+            try:
+                self._system_tap.start()
+            except OSError as e:
+                self.status = f"{self.mode}: {e}"
+                return
+            _rescan_audio_devices()   # the tap's device appears after a rescan
+        dev  = next(((i, ch) for i, n, ch in self._sources() if n == name and i >= 0), None)
         if dev is None:
             if self.mode in ("music", "rave"):
                 self.status = (f"{self.mode}: no loopback device — install BlackHole, or in Serato "
@@ -512,20 +531,27 @@ class Controller:
             return
         idx, channels = dev
         try:
+            # the device's own rate: the system audio tap runs at 48 kHz
+            self._sr = int(sd.query_devices(idx)["default_samplerate"]) or 44100
             if self.mode == "music":
                 self._a_peak = 0.001
-                stream = _open_loopback_stream(idx, channels, self._audio_callback)
+                stream = _open_loopback_stream(idx, channels, self._audio_callback,
+                                               samplerate=self._sr)
             elif self.mode == "rave":
-                stream = _open_loopback_stream(idx, channels, self._rave_callback, blocksize=1024)
+                stream = _open_loopback_stream(idx, channels, self._rave_callback,
+                                               blocksize=1024, samplerate=self._sr)
             else:
                 self._a_peak = 0.01
-                stream = sd.InputStream(samplerate=44100, blocksize=1024, channels=1,
+                stream = sd.InputStream(samplerate=self._sr, blocksize=1024, channels=1,
                                         device=idx, callback=self._audio_callback)
             stream.start()
         except Exception as e:
             self.status = f"{self.mode}: can't open {name} ({e})"
             return
         self._a_stream = stream
+        if name == SYSTEM_AUDIO:
+            self.status = (f"{self.mode.upper()}: listening to {SYSTEM_AUDIO} — if the meter stays "
+                           "flat, allow your terminal in Privacy & Security → Screen & System Audio Recording")
 
     def _cycle_source(self, direction: int) -> None:
         names = [n for _, n, _ in self._sources()]
@@ -539,7 +565,7 @@ class Controller:
             new = names[0] if direction > 0 else names[-1]
         self.source[self.mode] = new
         self.status = f"{self.mode.upper()}: listening to {new}"
-        self._start_stream()
+        self._start_stream()   # may replace the status with a hint or error
 
     # ── settings ──────────────────────────────────────────────────────────────
 
@@ -578,6 +604,8 @@ class Controller:
 
     def shutdown(self) -> None:
         self._stop_workers()
+        if self._system_tap:
+            self._system_tap.stop()
         # Close all devices in parallel — close() waits up to 1 s for device
         # FIN so serial shutdown of N devices would take N seconds.
         def _close_one(d: CozyLifeDevice) -> None:
