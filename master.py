@@ -2,10 +2,10 @@
 master.py — interactive TUI master control for CozyLife lights.
 
 Keys:
-  1 / 2 / 3 / 4 / 5   switch mode: OFF / DISCO / AUDIO / MANUAL / MUSIC
+  1 – 6                switch mode: OFF / DISCO / AUDIO / MANUAL / MUSIC / RAVE
   ↑ / ↓                navigate settings
   ← / →                decrease / increase selected setting value
-                       (on "Source": switch the audio input AUDIO / MUSIC listen to)
+                       (on "Source": switch the audio input AUDIO / MUSIC / RAVE listen to)
   r                    rediscover devices
   q                    quit
 
@@ -13,6 +13,8 @@ Modes
 -----
   AUDIO  — reacts to the microphone (ambient sound in the room)
   MUSIC  — reacts to the speaker output (music/media playing on this PC)
+  RAVE   — flashes laser colours on the beat of the speaker output, dark
+           between beats, off when the audio stops
 
 Usage:
   python master.py                          # auto-discover
@@ -95,10 +97,11 @@ def _find_loopback_device() -> tuple[Optional[int], Optional[int]]:
     return None, None
 
 
-def _open_loopback_stream(device_idx: Optional[int], channels: int, callback) -> "sd.InputStream":
+def _open_loopback_stream(device_idx: Optional[int], channels: int, callback,
+                          blocksize: int = 2048) -> "sd.InputStream":
     kwargs: dict = dict(
         samplerate=44100,
-        blocksize=2048,
+        blocksize=blocksize,
         channels=min(channels, 2),
         callback=callback,
     )
@@ -126,6 +129,13 @@ def _rescan_audio_devices() -> None:
         sd._initialize()
     except Exception:
         pass
+
+
+# RAVE: each beat flashes a saturated laser colour, lights go dark between
+# beats and switch off once the audio has been silent for a while.
+RAVE_PALETTE      = [0, 120, 240, 300, 180, 275]   # red green blue magenta cyan violet
+_RAVE_BASS        = (40.0, 160.0)                  # Hz band the beat detector watches
+_RAVE_SILENCE_RMS = 3e-4                           # input below this counts as silence
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -160,6 +170,17 @@ SETTINGS_META: dict[str, list[dict]] = {
         {"key": "light_interval", "label": "Update Rate", "min": 0.02, "max": 0.5,    "step": 0.01,  "fmt": "{:.2f}s"},
         {"key": "hue_spread",     "label": "Hue Spread",  "min": 0.0,  "max": 180.0,  "step": 5.0,   "fmt": "{:.0f}°"},
     ],
+    # Rave listens to the speaker loopback like music mode, but only flashes
+    # on beats.  A beat is bass energy above Beat Threshold × its running average.
+    "rave": [
+        {"key": "source",      "label": "Source",         "kind": "source"},
+        {"key": "threshold",   "label": "Beat Threshold", "min": 1.1,  "max": 4.0, "step": 0.1,  "fmt": "{:.1f}× avg"},
+        {"key": "flash_len",   "label": "Flash Length",   "min": 0.03, "max": 0.5, "step": 0.01, "fmt": "{:.2f}s"},
+        {"key": "min_gap",     "label": "Min Gap",        "min": 0.05, "max": 1.0, "step": 0.05, "fmt": "{:.2f}s"},
+        {"key": "silence_off", "label": "Off After",      "min": 0.2,  "max": 5.0, "step": 0.1,  "fmt": "{:.1f}s silence"},
+        {"key": "each_light",  "label": "Colours",        "min": 0.0,  "max": 1.0, "step": 1.0,
+         "fmt_fn": lambda v: "Same on all" if v < 0.5 else "Different per light"},
+    ],
     "manual": [
         {"key": "hue",        "label": "Hue",        "min": 0.0,   "max": 360.0, "step": 2.0,  "fmt": "{:.0f}°"},
         {"key": "saturation", "label": "Saturation", "min": 0.0,   "max": 100.0, "step": 2.0,  "fmt": "{:.0f}%"},
@@ -177,6 +198,8 @@ DEFAULT_SETTINGS: dict[str, dict] = {
                "freq_min": 80.0, "freq_max": 8000.0, "light_interval": 0.05, "hue_spread": 0.0},
     "music":  {"smoothing": 0.20, "gain_decay": 0.995,
                "freq_min": 60.0, "freq_max": 8000.0, "light_interval": 0.05, "hue_spread": 0.0},
+    "rave":   {"threshold": 1.5, "flash_len": 0.08, "min_gap": 0.15,
+               "silence_off": 1.0, "each_light": 1.0},
     "manual": {"hue": 0.0, "saturation": 90.0, "brightness": 200.0,
                "color_temp": 3500.0, "use_temp": 0.0},
 }
@@ -232,7 +255,15 @@ class Controller:
         self._a_stream: Optional[object] = None
         # audio input each reactive mode listens to, by device name (indices
         # shift when devices come and go); None = not picked yet
-        self.source: dict[str, Optional[str]] = {"audio": None, "music": None}
+        self.source: dict[str, Optional[str]] = {"audio": None, "music": None, "rave": None}
+        # rave state (written by _rave_callback, read by workers)
+        self._r_beat       = 0      # counts detected beats
+        self._r_beat_t     = 0.0    # monotonic time of the last beat
+        self._r_colour     = 0      # RAVE_PALETTE index for the current beat
+        self._r_heard_t    = 0.0    # monotonic time the input was last above silence
+        self._r_bass_avg   = 0.0
+        self._r_peak       = 1e-4
+        self._r_level      = 0.0    # 0–1 input level, for the meter
 
         self._stop    = threading.Event()
         self._workers: list[threading.Thread] = []
@@ -243,7 +274,7 @@ class Controller:
     # ── mode switching ────────────────────────────────────────────────────────
 
     def set_mode(self, mode: str) -> None:
-        if mode in ("audio", "music") and not AUDIO_AVAILABLE:
+        if mode in ("audio", "music", "rave") and not AUDIO_AVAILABLE:
             self.status = "audio unavailable — pip install sounddevice numpy"
             return
 
@@ -267,13 +298,13 @@ class Controller:
                     pass
             self._push_manual()
 
-        else:  # disco / audio / music
+        else:  # disco / audio / music / rave
             self._stop.clear()
             for idx, d in enumerate(self.devices):
                 t = threading.Thread(target=self._worker, args=(d, idx), daemon=True)
                 t.start()
                 self._workers.append(t)
-            if mode in ("audio", "music"):
+            if mode in ("audio", "music", "rave"):
                 _rescan_audio_devices()
                 if self.source[mode] is None:
                     self.source[mode] = self._default_source(mode)
@@ -292,6 +323,7 @@ class Controller:
         cmd_count  = 0
         total_cmds = 0
         rate_t     = time.monotonic()
+        rave_state = None   # what this light is currently showing in RAVE
 
         while not self._stop.is_set():
             mode = self.mode
@@ -312,6 +344,10 @@ class Controller:
                     if b > 5:
                         sent = device.stream_color(h, sat, b) is not False
                     self._stop.wait(s.get("light_interval", 0.05))
+
+                elif mode == "rave":
+                    sent, rave_state = self._rave_step(device, idx, s, rave_state)
+                    self._stop.wait(0.01)   # only sends when the target changes
 
             except OSError:
                 if self._stop.is_set():
@@ -371,11 +407,69 @@ class Controller:
         except Exception:
             pass
 
+    def _rave_step(self, device, idx: int, s: dict, shown):
+        """Move one light toward what RAVE wants now: the current beat's flash,
+        dark between beats, off after silence.  Returns (sent, what it shows);
+        a frame a Tuya bulb drops is retried on the next tick."""
+        with self.lock:
+            beat, beat_t, heard_t, colour = (self._r_beat, self._r_beat_t,
+                                             self._r_heard_t, self._r_colour)
+        now = time.monotonic()
+        if now - heard_t > s["silence_off"]:
+            want = "off"
+        elif beat and now - beat_t < s["flash_len"]:
+            want = ("flash", beat)
+        else:
+            want = "dark"
+        if want == shown:
+            return False, shown
+
+        if want == "off":
+            device.turn_off()
+            return True, want
+        offset = idx if s["each_light"] >= 0.5 else 0
+        hue = RAVE_PALETTE[(colour + offset) % len(RAVE_PALETTE)]
+        ok = device.stream_color(hue, 100, 255 if want != "dark" else 0) is not False
+        return ok, (want if ok else shown)
+
+    def _rave_callback(self, indata, frames, time_info, status) -> None:
+        # Same rule as _audio_callback: never let an exception escape.
+        try:
+            mono = indata.mean(axis=1)
+            s    = self.settings["rave"]
+            now  = time.monotonic()
+            rms  = float(np.sqrt(np.mean(mono ** 2)))
+            self._r_peak  = max(rms, self._r_peak * 0.995, 1e-4)
+            self._r_level = min(rms / self._r_peak, 1.0)
+            loud = rms >= _RAVE_SILENCE_RMS
+
+            spec  = np.abs(np.fft.rfft(mono * np.hanning(len(mono))))
+            freqs = np.fft.rfftfreq(len(mono), 1.0 / 44100)
+            band  = (freqs >= _RAVE_BASS[0]) & (freqs <= _RAVE_BASS[1])
+            bass  = float(np.sum(spec[band] ** 2))
+            avg   = self._r_bass_avg
+            self._r_bass_avg = avg + 0.05 * (bass - avg)   # ~0.5 s memory
+            # after silence avg is ~0, so the first loud block counts as a beat
+            beat = (loud and bass > s["threshold"] * avg
+                    and now - self._r_beat_t >= s["min_gap"])
+
+            with self.lock:
+                if loud:
+                    self._r_heard_t = now
+                if beat:
+                    self._r_beat  += 1
+                    self._r_beat_t = now
+                    # a different colour from the previous beat
+                    self._r_colour = (self._r_colour + random.randrange(1, len(RAVE_PALETTE))) \
+                                     % len(RAVE_PALETTE)
+        except Exception:
+            pass
+
     def _sources(self) -> list[tuple[int, str, int]]:
         """Inputs the current mode can listen to: every input device, plus the
         auto-detected loopback when it isn't one (Windows WASAPI loopback)."""
         devs = _input_devices()
-        if self.mode == "music":
+        if self.mode in ("music", "rave"):
             idx, ch = _find_loopback_device()
             if idx is not None and all(i != idx for i, _, _ in devs):
                 devs.insert(0, (idx, sd.query_devices(idx)["name"], ch or 2))
@@ -383,9 +477,9 @@ class Controller:
 
     @staticmethod
     def _default_source(mode: str) -> Optional[str]:
-        """Loopback device for MUSIC, the system default input for AUDIO."""
+        """Loopback device for MUSIC / RAVE, the system default input for AUDIO."""
         try:
-            if mode == "music":
+            if mode in ("music", "rave"):
                 idx, _ = _find_loopback_device()
                 return sd.query_devices(idx)["name"] if idx is not None else None
             return sd.query_devices(kind="input")["name"]
@@ -406,12 +500,13 @@ class Controller:
         self._close_stream()
         with self.lock:
             self._a_bri = 0
+            self._r_beat, self._r_beat_t, self._r_heard_t, self._r_bass_avg = 0, 0.0, 0.0, 0.0
         name = self.source[self.mode]
         dev  = next(((i, ch) for i, n, ch in self._sources() if n == name), None)
         if dev is None:
-            if self.mode == "music":
-                self.status = ("music: no loopback device — install BlackHole, or in Serato tick "
-                               "Setup → Audio → Make Audio Output Available; or pick a Source")
+            if self.mode in ("music", "rave"):
+                self.status = (f"{self.mode}: no loopback device — install BlackHole, or in Serato "
+                               "tick Setup → Audio → Make Audio Output Available; or pick a Source")
             else:
                 self.status = "audio: no input device — pick a Source"
             return
@@ -420,6 +515,8 @@ class Controller:
             if self.mode == "music":
                 self._a_peak = 0.001
                 stream = _open_loopback_stream(idx, channels, self._audio_callback)
+            elif self.mode == "rave":
+                stream = _open_loopback_stream(idx, channels, self._rave_callback, blocksize=1024)
             else:
                 self._a_peak = 0.01
                 stream = sd.InputStream(samplerate=44100, blocksize=1024, channels=1,
@@ -550,10 +647,11 @@ def draw(stdscr, ctrl: Controller) -> None:
         ("audio",  "3", " AUDIO  "),
         ("manual", "4", " MANUAL "),
         ("music",  "5", " MUSIC  "),
+        ("rave",   "6", " RAVE   "),
     ]
     x = 2
     for mkey, num, label in mode_defs:
-        unavail = mkey in ("audio", "music") and not AUDIO_AVAILABLE
+        unavail = mkey in ("audio", "music", "rave") and not AUDIO_AVAILABLE
         if unavail:
             attr = C_DIM
         elif mkey == ctrl.mode:
@@ -615,6 +713,28 @@ def draw(stdscr, ctrl: Controller) -> None:
         put(r, cx, f"  {ab:3d}", C_DIM)
         r += 1
 
+    # rave meter: input level and the beat flashes
+    if ctrl.mode == "rave" and AUDIO_AVAILABLE:
+        r += 1
+        put(r, 2, f"Live ({ctrl.source.get('rave') or 'no source'}):", curses.A_BOLD)
+        r += 1
+        rs  = ctrl.settings["rave"]
+        now = time.monotonic()
+        with ctrl.lock:
+            beats, beat_t, heard_t = ctrl._r_beat, ctrl._r_beat_t, ctrl._r_heard_t
+        cx = put(r, 4, "Level ", C_DIM)
+        put(r, cx, f"[{_bar(ctrl._r_level, 0, 1, 20)}]", C_VAL)
+        r += 1
+        if now - heard_t > rs["silence_off"]:
+            beat_str = "silence — lights off"
+        elif now - beat_t < max(rs["flash_len"], 0.12):   # long enough to see
+            beat_str = "● FLASH"
+        else:
+            beat_str = "○"
+        cx = put(r, 4, "Beat  ", C_DIM)
+        put(r, cx, f"{beat_str:<22}{beats} beats", C_VAL)
+        r += 1
+
     r += 1
     put(r, 0, "─" * (cols - 1), C_DIM)
     r += 1
@@ -670,7 +790,7 @@ def draw(stdscr, ctrl: Controller) -> None:
     if help_row > r:
         put(help_row, 0, "─" * (cols - 1), C_DIM)
         put(help_row + 1, 0,
-            "  ↑/↓ navigate   ←/→ adjust   1-5 mode   r rediscover   d debug   q/Esc quit",
+            "  ↑/↓ navigate   ←/→ adjust   1-6 mode   r rediscover   d debug   q/Esc quit",
             C_DIM)
 
     stdscr.refresh()
@@ -714,6 +834,8 @@ def _run(stdscr, devices: list, notes: list[str]) -> None:
                 ctrl.set_mode("manual")
             elif key == ord("5"):
                 ctrl.set_mode("music")
+            elif key == ord("6"):
+                ctrl.set_mode("rave")
             elif key == curses.KEY_UP:
                 ctrl.nav(-1)
             elif key == curses.KEY_DOWN:

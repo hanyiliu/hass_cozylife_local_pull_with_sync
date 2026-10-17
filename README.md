@@ -94,7 +94,7 @@ loopback automatically, so skip this step there.
 python master.py
 ```
 
-Press **5** for MUSIC mode and play something. CozyLife lights are found
+Press **5** for MUSIC mode (or **6** for RAVE) and play something. CozyLife lights are found
 automatically and Tuya bulbs come from `devices.json`; they're all listed at
 the bottom of the screen.
 
@@ -112,21 +112,38 @@ python master.py 192.168.1.100 192.168.1.101 # specific CozyLife IPs (+ devices.
 
 | Key | Action |
 |---|---|
-| `1`–`5` | OFF / DISCO / AUDIO (microphone) / MANUAL / MUSIC (speaker output) |
+| `1`–`6` | OFF / DISCO / AUDIO (microphone) / MANUAL / MUSIC (speaker output) / RAVE (speaker output) |
 | `↑` / `↓` | Select a setting |
 | `←` / `→` | Change it |
 | `r` | Rediscover lights |
 | `d` | Toggle the per-light debug panel (send rate, socket buffers) |
 | `q` / `Esc` | Quit and turn everything off |
 
-In AUDIO and MUSIC, the first setting is **Source**: press `←` / `→` on it to
-switch which audio input the lights follow (Serato Virtual Audio, BlackHole, a
-microphone, …) without leaving the mode. MUSIC starts on the detected loopback
-device and AUDIO on the system's default input; each remembers its own choice.
+In AUDIO, MUSIC and RAVE, the first setting is **Source**: press `←` / `→` on it
+to switch which audio input the lights follow (Serato Virtual Audio, BlackHole, a
+microphone, …) without leaving the mode. MUSIC and RAVE start on the detected
+loopback device and AUDIO on the system's default input; each remembers its own
+choice.
 Devices added while `master.py` is running show up the next time you switch
 into the mode.
 
 `Hue Spread` (AUDIO / MUSIC) offsets each light's colour so they don't all match.
+
+**RAVE** follows the same audio as MUSIC but strobes like lasers: every beat
+(a kick in the 40–160 Hz band) flashes the lights to full brightness in a
+saturated laser colour, they go dark between beats, and they switch off once
+the audio has been silent for a moment. Its settings:
+
+| Setting | Effect |
+|---|---|
+| Beat Threshold | How far bass energy must jump above its running average to count as a beat — lower flashes more |
+| Flash Length | How long each flash stays lit |
+| Min Gap | Shortest time between flashes |
+| Off After | Seconds of silence before the lights switch off |
+| Colours | Same colour on every light, or a different one per light |
+
+Tuya bulbs take about 0.1 s per command, so their flashes last at least that
+long whatever Flash Length says.
 
 ---
 
