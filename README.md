@@ -82,8 +82,8 @@ Music mode listens to what your Mac is playing through a loopback driver:
 DJing in **Serato DJ Pro**? Its audio goes straight to your controller, so the
 Mac's output (and BlackHole) never hears it. Instead, tick Setup → Audio →
 **Make Audio Output Available to Other Applications** in Serato; music mode
-picks up **Serato Virtual Audio** automatically. The MUSIC meter in `master.py`
-shows which source it's listening to.
+picks up **Serato Virtual Audio** automatically. In `master.py`, the **Source**
+row in MUSIC shows what it's listening to — press `←` / `→` there to switch.
 
 Linux uses the PulseAudio/PipeWire monitor source and Windows uses WASAPI
 loopback automatically, so skip this step there.
@@ -118,6 +118,13 @@ python master.py 192.168.1.100 192.168.1.101 # specific CozyLife IPs (+ devices.
 | `r` | Rediscover lights |
 | `d` | Toggle the per-light debug panel (send rate, socket buffers) |
 | `q` / `Esc` | Quit and turn everything off |
+
+In AUDIO and MUSIC, the first setting is **Source**: press `←` / `→` on it to
+switch which audio input the lights follow (Serato Virtual Audio, BlackHole, a
+microphone, …) without leaving the mode. MUSIC starts on the detected loopback
+device and AUDIO on the system's default input; each remembers its own choice.
+Devices added while `master.py` is running show up the next time you switch
+into the mode.
 
 `Hue Spread` (AUDIO / MUSIC) offsets each light's colour so they don't all match.
 
