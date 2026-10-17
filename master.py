@@ -5,6 +5,7 @@ Keys:
   1 / 2 / 3 / 4 / 5   switch mode: OFF / DISCO / AUDIO / MANUAL / MUSIC
   ↑ / ↓                navigate settings
   ← / →                decrease / increase selected setting value
+                       (on "Source": switch the audio input AUDIO / MUSIC listen to)
   r                    rediscover devices
   q                    quit
 
@@ -111,6 +112,22 @@ def _open_loopback_stream(device_idx: Optional[int], channels: int, callback) ->
     return sd.InputStream(**kwargs)
 
 
+def _input_devices() -> list[tuple[int, str, int]]:
+    """(index, name, input channels) for every device that can be recorded from."""
+    return [(i, d["name"], d["max_input_channels"])
+            for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0]
+
+
+def _rescan_audio_devices() -> None:
+    """Pick up audio devices added since start-up — PortAudio only lists them
+    when it initialises.  Only call with no stream open."""
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception:
+        pass
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Settings metadata — defines every tunable knob per mode
 # ──────────────────────────────────────────────────────────────────────────────
@@ -124,6 +141,7 @@ SETTINGS_META: dict[str, list[dict]] = {
         {"key": "bri",       "label": "Brightness","min": 0.0,  "max": 255.0,  "step": 10.0, "fmt": "{:.0f}"},
     ],
     "audio": [
+        {"key": "source",         "label": "Source",      "kind": "source"},
         {"key": "smoothing",      "label": "Smoothing",   "min": 0.01, "max": 0.99,   "step": 0.05,  "fmt": "{:.2f}"},
         {"key": "gain_decay",     "label": "Gain Decay",  "min": 0.90, "max": 0.999,  "step": 0.001, "fmt": "{:.3f}"},
         {"key": "freq_min",       "label": "Freq Min",    "min": 20.0, "max": 500.0,  "step": 10.0,  "fmt": "{:.0f} Hz"},
@@ -134,6 +152,7 @@ SETTINGS_META: dict[str, list[dict]] = {
     # Music mode shares the same DSP knobs as audio mode but reads from the
     # speaker loopback instead of the microphone.
     "music": [
+        {"key": "source",         "label": "Source",      "kind": "source"},
         {"key": "smoothing",      "label": "Smoothing",   "min": 0.01, "max": 0.99,   "step": 0.05,  "fmt": "{:.2f}"},
         {"key": "gain_decay",     "label": "Gain Decay",  "min": 0.90, "max": 0.999,  "step": 0.001, "fmt": "{:.3f}"},
         {"key": "freq_min",       "label": "Freq Min",    "min": 20.0, "max": 500.0,  "step": 10.0,  "fmt": "{:.0f} Hz"},
@@ -211,10 +230,9 @@ class Controller:
         self._a_sat   = 90.0
         self._a_peak  = 0.01
         self._a_stream: Optional[object] = None
-        # music-mode loopback device (detected once, reused on mode switches)
-        self._music_dev_idx: Optional[int] = None
-        self._music_channels: int = 1
-        self._music_dev_name: str = "speaker output"
+        # audio input each reactive mode listens to, by device name (indices
+        # shift when devices come and go); None = not picked yet
+        self.source: dict[str, Optional[str]] = {"audio": None, "music": None}
 
         self._stop    = threading.Event()
         self._workers: list[threading.Thread] = []
@@ -229,19 +247,10 @@ class Controller:
             self.status = "audio unavailable — pip install sounddevice numpy"
             return
 
-        if mode == "music" and self._music_dev_idx is None:
-            dev_idx, channels = _find_loopback_device()
-            if dev_idx is None:
-                self.status = ("music: no loopback device — install BlackHole, or in Serato "
-                               "tick Setup → Audio → Make Audio Output Available (see README)")
-                return
-            self._music_dev_idx = dev_idx
-            self._music_channels = channels or 2
-            self._music_dev_name = sd.query_devices(dev_idx)["name"]
-
         self._stop_workers()
         self.mode = mode
         self.sel  = 0
+        self.status = f"Mode: {mode.upper()}"
 
         if mode == "off":
             for d in self.devices:
@@ -264,21 +273,14 @@ class Controller:
                 t = threading.Thread(target=self._worker, args=(d, idx), daemon=True)
                 t.start()
                 self._workers.append(t)
-            if mode == "audio":
-                self._start_audio()
-            elif mode == "music":
-                self._start_music()
-
-        self.status = f"Mode: {mode.upper()}"
+            if mode in ("audio", "music"):
+                _rescan_audio_devices()
+                if self.source[mode] is None:
+                    self.source[mode] = self._default_source(mode)
+                self._start_stream()
 
     def _stop_workers(self) -> None:
-        if self._a_stream:
-            try:
-                self._a_stream.stop()
-                self._a_stream.close()
-            except Exception:
-                pass
-            self._a_stream = None
+        self._close_stream()
         self._stop.set()
         for t in self._workers:
             t.join(timeout=6.0)  # must exceed socket send timeout (5s)
@@ -369,20 +371,78 @@ class Controller:
         except Exception:
             pass
 
-    def _start_audio(self) -> None:
-        self._a_peak = 0.01
-        stream = sd.InputStream(samplerate=44100, blocksize=1024,
-                                channels=1, callback=self._audio_callback)
-        stream.start()
+    def _sources(self) -> list[tuple[int, str, int]]:
+        """Inputs the current mode can listen to: every input device, plus the
+        auto-detected loopback when it isn't one (Windows WASAPI loopback)."""
+        devs = _input_devices()
+        if self.mode == "music":
+            idx, ch = _find_loopback_device()
+            if idx is not None and all(i != idx for i, _, _ in devs):
+                devs.insert(0, (idx, sd.query_devices(idx)["name"], ch or 2))
+        return devs
+
+    @staticmethod
+    def _default_source(mode: str) -> Optional[str]:
+        """Loopback device for MUSIC, the system default input for AUDIO."""
+        try:
+            if mode == "music":
+                idx, _ = _find_loopback_device()
+                return sd.query_devices(idx)["name"] if idx is not None else None
+            return sd.query_devices(kind="input")["name"]
+        except Exception:
+            return None
+
+    def _close_stream(self) -> None:
+        if self._a_stream:
+            try:
+                self._a_stream.stop()
+                self._a_stream.close()
+            except Exception:
+                pass
+            self._a_stream = None
+
+    def _start_stream(self) -> None:
+        """(Re)open the input stream for the current mode's Source."""
+        self._close_stream()
+        with self.lock:
+            self._a_bri = 0
+        name = self.source[self.mode]
+        dev  = next(((i, ch) for i, n, ch in self._sources() if n == name), None)
+        if dev is None:
+            if self.mode == "music":
+                self.status = ("music: no loopback device — install BlackHole, or in Serato tick "
+                               "Setup → Audio → Make Audio Output Available; or pick a Source")
+            else:
+                self.status = "audio: no input device — pick a Source"
+            return
+        idx, channels = dev
+        try:
+            if self.mode == "music":
+                self._a_peak = 0.001
+                stream = _open_loopback_stream(idx, channels, self._audio_callback)
+            else:
+                self._a_peak = 0.01
+                stream = sd.InputStream(samplerate=44100, blocksize=1024, channels=1,
+                                        device=idx, callback=self._audio_callback)
+            stream.start()
+        except Exception as e:
+            self.status = f"{self.mode}: can't open {name} ({e})"
+            return
         self._a_stream = stream
 
-    def _start_music(self) -> None:
-        self._a_peak = 0.001
-        stream = _open_loopback_stream(
-            self._music_dev_idx, self._music_channels, self._audio_callback
-        )
-        stream.start()
-        self._a_stream = stream
+    def _cycle_source(self, direction: int) -> None:
+        names = [n for _, n, _ in self._sources()]
+        if not names:
+            self.status = "No audio inputs found"
+            return
+        cur = self.source[self.mode]
+        if cur in names:
+            new = names[(names.index(cur) + direction) % len(names)]
+        else:
+            new = names[0] if direction > 0 else names[-1]
+        self.source[self.mode] = new
+        self.status = f"{self.mode.upper()}: listening to {new}"
+        self._start_stream()
 
     # ── settings ──────────────────────────────────────────────────────────────
 
@@ -396,6 +456,9 @@ class Controller:
         if not meta or self.sel >= len(meta):
             return
         m   = meta[self.sel]
+        if m.get("kind") == "source":
+            self._cycle_source(direction)
+            return
         key = m["key"]
         cur = self.settings[self.mode].get(key, m["min"])
         new = max(m["min"], min(m["max"], cur + direction * m["step"]))
@@ -512,9 +575,13 @@ def draw(stdscr, ctrl: Controller) -> None:
         r += 1
         s = ctrl.settings.get(ctrl.mode, {})
         for i, m in enumerate(meta):
-            val     = s.get(m["key"], m["min"])
-            val_str = m["fmt_fn"](val) if "fmt_fn" in m else m["fmt"].format(val)
-            bar_str = _bar(val, m["min"], m["max"]) if "fmt_fn" not in m else None
+            if m.get("kind") == "source":
+                val_str = ctrl.source.get(ctrl.mode) or "none"
+                bar_str = None
+            else:
+                val     = s.get(m["key"], m["min"])
+                val_str = m["fmt_fn"](val) if "fmt_fn" in m else m["fmt"].format(val)
+                bar_str = _bar(val, m["min"], m["max"]) if "fmt_fn" not in m else None
             is_sel  = i == ctrl.sel
             prefix  = "  ▶ " if is_sel else "    "
             label_a = C_SEL if is_sel else curses.A_NORMAL
@@ -534,7 +601,7 @@ def draw(stdscr, ctrl: Controller) -> None:
     # live reactive meters (audio and music modes)
     if ctrl.mode in ("audio", "music") and AUDIO_AVAILABLE:
         r += 1
-        src_label = "microphone" if ctrl.mode == "audio" else ctrl._music_dev_name
+        src_label = ctrl.source.get(ctrl.mode) or "no source"
         put(r, 2, f"Live ({src_label}):", curses.A_BOLD)
         r += 1
         with ctrl.lock:
