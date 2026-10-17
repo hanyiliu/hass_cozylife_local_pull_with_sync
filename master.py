@@ -41,7 +41,7 @@ except ImportError:
     _HAS_FIONREAD = False
 
 from cozylife import CozyLifeDevice
-from tuya_light import load_tuya_lights
+from tuya_light import TuyaLight, load_tuya_lights
 
 try:
     import numpy as np
@@ -50,8 +50,11 @@ try:
 except ImportError:
     AUDIO_AVAILABLE = False
 
-# macOS virtual-audio driver names recognised as loopback sources
-_MACOS_LOOPBACK_NAMES = ["BlackHole", "Soundflower", "Loopback", "VB-Audio"]
+# macOS virtual-audio driver names recognised as loopback sources.  Serato
+# Virtual Audio carries Serato DJ's master output, which otherwise goes straight
+# to the DJ controller and never reaches the Mac's own output.
+_MACOS_LOOPBACK_NAMES = ["BlackHole", "Soundflower", "Loopback", "VB-Audio",
+                         "Serato Virtual Audio"]
 
 
 def _find_loopback_device() -> tuple[Optional[int], Optional[int]]:
@@ -211,6 +214,7 @@ class Controller:
         # music-mode loopback device (detected once, reused on mode switches)
         self._music_dev_idx: Optional[int] = None
         self._music_channels: int = 1
+        self._music_dev_name: str = "speaker output"
 
         self._stop    = threading.Event()
         self._workers: list[threading.Thread] = []
@@ -228,11 +232,12 @@ class Controller:
         if mode == "music" and self._music_dev_idx is None:
             dev_idx, channels = _find_loopback_device()
             if dev_idx is None:
-                self.status = ("music: no loopback device found — "
-                               "see music_lights.py --list-audio")
+                self.status = ("music: no loopback device — install BlackHole, or in Serato "
+                               "tick Setup → Audio → Make Audio Output Available (see README)")
                 return
             self._music_dev_idx = dev_idx
             self._music_channels = channels or 2
+            self._music_dev_name = sd.query_devices(dev_idx)["name"]
 
         self._stop_workers()
         self.mode = mode
@@ -441,6 +446,10 @@ def _bar(val: float, lo: float, hi: float, width: int = BAR_W) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def _device_label(d) -> str:
+    return f"● {d.ip}  {d.name} (Tuya)" if isinstance(d, TuyaLight) else f"● {d.ip}"
+
+
 def draw(stdscr, ctrl: Controller) -> None:
     stdscr.erase()
     rows, cols = stdscr.getmaxyx()
@@ -525,7 +534,7 @@ def draw(stdscr, ctrl: Controller) -> None:
     # live reactive meters (audio and music modes)
     if ctrl.mode in ("audio", "music") and AUDIO_AVAILABLE:
         r += 1
-        src_label = "microphone" if ctrl.mode == "audio" else "speaker output"
+        src_label = "microphone" if ctrl.mode == "audio" else ctrl._music_dev_name
         put(r, 2, f"Live ({src_label}):", curses.A_BOLD)
         r += 1
         with ctrl.lock:
@@ -547,7 +556,7 @@ def draw(stdscr, ctrl: Controller) -> None:
     put(r, 2, f"Devices ({len(ctrl.devices)} connected)", curses.A_BOLD)
     r += 1
     for d in ctrl.devices:
-        put(r, 4, f"● {d.ip}", C_DEV)
+        put(r, 4, _device_label(d), C_DEV)
         r += 1
 
     # debug panel
@@ -566,7 +575,7 @@ def draw(stdscr, ctrl: Controller) -> None:
             cr = dbg.get("cmd_rate",    0.0)
             tc = dbg.get("total_cmds",    0)
 
-            put(r, 4, f"● {d.ip}", C_DEV)
+            put(r, 4, _device_label(d), C_DEV)
             r += 1
 
             if rp >= 0 and rb > 0:
@@ -604,7 +613,7 @@ def draw(stdscr, ctrl: Controller) -> None:
 # Main loop
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _run(stdscr, devices: list[CozyLifeDevice]) -> None:
+def _run(stdscr, devices: list, notes: list[str]) -> None:
     curses.curs_set(0)
     stdscr.nodelay(True)
     curses.start_color()
@@ -618,6 +627,8 @@ def _run(stdscr, devices: list[CozyLifeDevice]) -> None:
     curses.init_pair(7, curses.COLOR_WHITE, -1)                   # dim text
 
     ctrl = Controller(devices)
+    if notes:
+        ctrl.status = " · ".join(notes)
 
     try:
         while True:
@@ -650,9 +661,10 @@ def _run(stdscr, devices: list[CozyLifeDevice]) -> None:
                 ctrl.status = "Rediscovering..."
                 draw(stdscr, ctrl)
                 ctrl.shutdown()
-                new_devices = CozyLifeDevice.discover() + load_tuya_lights()
+                notes = []
+                new_devices = CozyLifeDevice.discover() + load_tuya_lights(log=notes.append)
                 ctrl = Controller(new_devices)
-                ctrl.status = f"Found {len(new_devices)} device(s)"
+                ctrl.status = " · ".join([f"Found {len(new_devices)} device(s)"] + notes)
             elif key == curses.KEY_RESIZE:
                 pass  # redraws automatically next tick
 
@@ -676,15 +688,21 @@ def main() -> None:
     else:
         print("Discovering devices...")
         devices = CozyLifeDevice.discover()
-    devices += load_tuya_lights()
+    # Printed now, and kept in the TUI status line since curses clears the screen
+    notes: list[str] = []
+    tuya = load_tuya_lights(log=notes.append)
+    devices += tuya
+    for note in notes:
+        print(f"  {note}")
 
     if not devices:
         print("No devices found. Try: python master.py 192.168.1.x")
         return
 
-    print(f"Connected to {len(devices)} device(s). Launching TUI...")
+    print(f"Connected to {len(devices) - len(tuya)} CozyLife + {len(tuya)} Tuya device(s). "
+          "Launching TUI...")
     time.sleep(0.3)
-    curses.wrapper(_run, devices)
+    curses.wrapper(_run, devices, notes)
 
 
 if __name__ == "__main__":

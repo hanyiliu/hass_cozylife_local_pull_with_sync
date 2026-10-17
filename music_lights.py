@@ -12,7 +12,9 @@ Linux   — PulseAudio / PipeWire: uses the default-sink monitor source
 macOS   — Requires a virtual-audio driver such as BlackHole or Soundflower.
            Install one and set it as the system output (or use a multi-output
            device so you still hear sound).  This script auto-detects common
-           driver names.
+           driver names.  For Serato DJ, whose audio goes straight to the
+           controller, tick Setup → Audio → "Make Audio Output Available to
+           Other Applications" instead; Serato Virtual Audio is detected too.
 Windows — Uses WASAPI loopback: no extra software needed; reads from the
            default render endpoint directly.
 
@@ -56,7 +58,8 @@ MIN_GAIN       = 0.001         # prevents divide-by-zero in silence
 LIGHT_INTERVAL = 0.05          # seconds between TCP sends per light
 
 # macOS virtual-audio driver names to try (in priority order)
-MACOS_LOOPBACK_NAMES = ["BlackHole", "Soundflower", "Loopback", "VB-Audio"]
+MACOS_LOOPBACK_NAMES = ["BlackHole", "Soundflower", "Loopback", "VB-Audio",
+                        "Serato Virtual Audio"]
 
 # ------------------------------------------------------------------
 # Audio device selection
@@ -158,7 +161,8 @@ def _print_platform_hint() -> None:
               " source exists (pactl list short sources | grep monitor).")
     elif system == "Darwin":
         print("Hint: install BlackHole (https://github.com/ExistentialAudio/BlackHole)"
-              " and route your system audio through it.")
+              " and route your system audio through it.  DJing in Serato? Tick"
+              " Setup → Audio → Make Audio Output Available to Other Applications.")
     elif system == "Windows":
         print("Hint: WASAPI loopback should work automatically. Make sure"
               " sounddevice ≥ 0.4.0 is installed.")
@@ -288,7 +292,7 @@ def main() -> None:
     else:
         print("Discovering devices...")
         devices = CozyLifeDevice.discover()
-    devices += load_tuya_lights()
+    devices += load_tuya_lights(log=lambda note: print(f"  {note}"))
 
     if not devices:
         print("No devices found.")

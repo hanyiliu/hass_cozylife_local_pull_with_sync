@@ -79,6 +79,12 @@ Music mode listens to what your Mac is playing through a loopback driver:
    your speakers/headphones and **BlackHole 2ch**.
 3. In System Settings → Sound → Output, choose the Multi-Output Device.
 
+DJing in **Serato DJ Pro**? Its audio goes straight to your controller, so the
+Mac's output (and BlackHole) never hears it. Instead, tick Setup → Audio →
+**Make Audio Output Available to Other Applications** in Serato; music mode
+picks up **Serato Virtual Audio** automatically. The MUSIC meter in `master.py`
+shows which source it's listening to.
+
 Linux uses the PulseAudio/PipeWire monitor source and Windows uses WASAPI
 loopback automatically, so skip this step there.
 
