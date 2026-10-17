@@ -139,7 +139,7 @@ def main():
     else:
         print("Discovering devices...")
         devices = CozyLifeDevice.discover()
-    devices += load_tuya_lights()
+    devices += load_tuya_lights(log=lambda note: print(f"  {note}"))
 
     if not devices:
         print("No devices found.")

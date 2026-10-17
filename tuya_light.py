@@ -228,13 +228,18 @@ class TuyaLight:
         self._on, self._mode = True, "white"
 
 
-def load_tuya_lights(path: str = DEVICES_FILE) -> list[TuyaLight]:
+def load_tuya_lights(path: str = DEVICES_FILE, log=print) -> list[TuyaLight]:
     """Connect to every colour bulb listed in tinytuya's devices.json.
 
-    Returns [] when tinytuya isn't installed or the file doesn't exist, so
-    CozyLife-only setups are unaffected.
+    Returns [] when the file doesn't exist or tinytuya isn't installed, so
+    CozyLife-only setups still run; log() gets a one-line reason for every
+    light that isn't loaded.
     """
-    if not TUYA_AVAILABLE or not os.path.exists(path):
+    if not os.path.exists(path):
+        log("Tuya: no devices.json — run `python tuya_keys.py <user code>` to add Smart Life bulbs")
+        return []
+    if not TUYA_AVAILABLE:
+        log("Tuya: devices.json found but tinytuya isn't installed — pip install tinytuya")
         return []
     with open(path) as f:
         entries = json.load(f)
@@ -245,11 +250,11 @@ def load_tuya_lights(path: str = DEVICES_FILE) -> list[TuyaLight]:
         if not e.get("key"):
             continue
         if not e.get("ip"):
-            print(f"  Tuya {label}: no IP in devices.json — rerun tuya_keys.py on this network")
+            log(f"Tuya {label}: no IP in devices.json — rerun tuya_keys.py on this network")
             continue
         try:
             lights.append(TuyaLight(e["id"], e["ip"], e["key"],
                                     float(e.get("version") or 3.3), e.get("name", "")))
         except OSError as err:
-            print(f"  Tuya {label}: skipped ({err})")
+            log(f"Tuya {label}: skipped ({err})")
     return lights
