@@ -135,3 +135,8 @@ tmp_cache
 /homeassistant
 /.idea
 /__pycache__
+# tinytuya wizard output — holds Tuya API secrets and device local keys
+devices.json
+tinytuya.json
+tuya-raw.json
+snapshot.json

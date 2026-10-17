@@ -131,6 +131,37 @@ Tuning knobs at the top of the file:
 
 ---
 
+### Tuya / Smart Life lights
+
+`master.py`, `music_lights.py` and `audio_lights.py` also drive Tuya-based Wi-Fi
+bulbs (the ones set up in the Smart Life or Tuya Smart app) alongside the
+CozyLife lights, through `tuya_light.py`.
+
+Tuya bulbs encrypt their local protocol with a per-device key that only Tuya's
+cloud hands out, so fetch it once:
+
+1. Create a free account at [platform.tuya.com](https://platform.tuya.com), create a
+   Cloud project, and link your Smart Life app account to it (Devices → Link App
+   Account → scan the QR code from the app).
+2. From this folder:
+
+   ```bash
+   pip install tinytuya
+   python -m tinytuya wizard      # paste the project's Access ID / Secret; answer "y" to poll devices
+   ```
+
+This writes `devices.json` (device IDs, local keys and IPs) next to the scripts;
+they load it on startup and skip anything that isn't a colour bulb. The file holds
+secrets and is gitignored. If a bulb's IP changes, rerun the wizard or edit its
+`ip` in `devices.json`.
+
+Tuya bulbs queue commands they can't apply in time, which shows up as growing
+lag. Each bulb answers every command ~100 ms later, so `tuya_light.py` waits for
+that answer before sending the next colour — every bulb runs as fast as it can
+(about 8 updates/s for A19 bulbs) and never falls behind the music.
+
+---
+
 ### Feedback
 
 * Please submit an issue
