@@ -156,8 +156,9 @@ secrets and is gitignored. If a bulb's IP changes, rerun the wizard or edit its
 `ip` in `devices.json`.
 
 Tuya bulbs queue commands they can't apply in time, which shows up as growing
-lag, so `tuya_light.py` caps them at 10 updates/s (`MIN_INTERVAL`). Lower it if
-yours keep up, raise it if they lag behind the music.
+lag. Each bulb answers every command ~100 ms later, so `tuya_light.py` waits for
+that answer before sending the next colour — every bulb runs as fast as it can
+(about 8 updates/s for A19 bulbs) and never falls behind the music.
 
 ---
 

@@ -294,8 +294,8 @@ class Controller:
                 if mode == "disco":
                     hue = random.uniform(0, 360)
                     sat = random.uniform(s.get("sat_min", 60), s.get("sat_max", 100))
-                    device.stream_color(hue, sat, int(s.get("bri", 255)))
-                    sent = True
+                    # Tuya lights return False when they skip a frame
+                    sent = device.stream_color(hue, sat, int(s.get("bri", 255))) is not False
                     self._stop.wait(s.get("interval", 0.05))
 
                 elif mode in ("audio", "music"):
@@ -303,8 +303,7 @@ class Controller:
                         h, b, sat = self._a_hue, self._a_bri, self._a_sat
                     h = (h + idx * s.get("hue_spread", 0.0)) % 360
                     if b > 5:
-                        device.stream_color(h, sat, b)
-                        sent = True
+                        sent = device.stream_color(h, sat, b) is not False
                     self._stop.wait(s.get("light_interval", 0.05))
 
             except OSError:

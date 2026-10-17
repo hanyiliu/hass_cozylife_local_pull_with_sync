@@ -20,6 +20,7 @@ Usage:
 import json
 import os
 import socket
+import struct
 import time
 from typing import Optional
 
@@ -33,9 +34,14 @@ except ImportError:
 DEVICES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "devices.json")
 
 # Tuya bulbs queue commands they can't keep up with, so lag builds up if they
-# are sent faster than they can apply them.  Stream updates arriving sooner than
-# this are dropped (the next one carries the latest colour anyway).
-MIN_INTERVAL = 0.1
+# are sent faster than they can apply them (~8/s for A19 bulbs measured on
+# v3.5).  The bulb answers every command with a status report ~100 ms later,
+# so stream updates wait for that reply before sending the next one; updates
+# arriving in between are dropped (the next one carries the latest colour).
+# If a reply goes missing, sending resumes after this long.
+REPLY_TIMEOUT = 0.5
+
+_STATUS_CMD = 8
 
 
 class TuyaLight:
@@ -55,6 +61,8 @@ class TuyaLight:
         self._on   = False
         self._mode: Optional[str] = None
         self._last_send = 0.0
+        self._awaiting_reply = False
+        self._rx = b""
         self._connect()
 
     # ------------------------------------------------------------------
@@ -82,6 +90,8 @@ class TuyaLight:
 
     def close(self) -> None:
         self._dev.close()
+        self._awaiting_reply = False
+        self._rx = b""
 
     @property
     def _sock(self) -> Optional[socket.socket]:
@@ -105,13 +115,14 @@ class TuyaLight:
         if result and "Error" in result:
             raise OSError(f"{self.ip}: {result['Error']}")
         self._last_send = time.monotonic()
+        self._awaiting_reply = True
         self._drain()
 
     def _drain(self) -> None:
-        """Discard the status packets the bulb sends back after every command.
+        """Read and discard what the bulb sent, noting any status reply.
 
-        Same reason as CozyLifeDevice._drain(): unread replies fill the
-        kernel recv buffer until the bulb's sends stall.
+        Unread replies would fill the kernel recv buffer until the bulb's
+        sends stall (same as CozyLifeDevice._drain()).
         """
         sock = self._dev.socket
         if sock is None:
@@ -119,14 +130,49 @@ class TuyaLight:
         try:
             sock.setblocking(False)
             while True:
-                if not sock.recv(4096):
+                data = sock.recv(4096)
+                if not data:
                     # Bulb closed the connection (idle timeout); the next
                     # send opens a fresh one.
-                    self._dev.close()
+                    self.close()
                     return
+                self._rx += data
         except OSError:
             pass
         sock.settimeout(self._dev.connection_timeout)
+        if _STATUS_CMD in self._take_frames():
+            self._awaiting_reply = False
+
+    def _take_frames(self) -> list[int]:
+        """Pop complete messages off self._rx and return their command codes.
+
+        Only the cleartext headers are read — no decryption needed.
+        """
+        cmds = []
+        while True:
+            start = min((i for i in (self._rx.find(b"\x00\x00\x55\xaa"),
+                                     self._rx.find(b"\x00\x00\x66\x99")) if i >= 0),
+                        default=-1)
+            if start < 0:
+                self._rx = self._rx[-3:]   # keep a possible partial prefix
+                return cmds
+            buf = self._rx[start:]
+            if buf[2:4] == b"\x55\xaa" and len(buf) >= 16:
+                _, _, cmd, length = struct.unpack(">4I", buf[:16])
+                total = 16 + length
+            elif buf[2:4] == b"\x66\x99" and len(buf) >= 18:
+                _, _, _, cmd, length = struct.unpack(">IHIII", buf[:18])
+                total = 18 + length + 4
+            else:
+                total = None
+            if total is not None and total > 4096:
+                self._rx = buf[4:]         # not a real header; resync
+                continue
+            if total is None or len(buf) < total:
+                self._rx = buf
+                return cmds
+            cmds.append(cmd)
+            self._rx = buf[total:]
 
     def _value(self, fraction: float) -> int:
         """Scale 0.0–1.0 onto this bulb's brightness range (e.g. 10–1000)."""
@@ -149,13 +195,16 @@ class TuyaLight:
         self._set({self._dev.dpset["switch"]: False})
         self._on = False
 
-    def stream_color(self, hue: float, saturation: float, brightness: int) -> None:
+    def stream_color(self, hue: float, saturation: float, brightness: int) -> bool:
         """Fire-and-forget colour update for high-rate loops (music, disco).
 
-        hue 0–360, saturation 0–100, brightness 0–255.
+        hue 0–360, saturation 0–100, brightness 0–255.  Returns False if the
+        update was dropped because the bulb hasn't answered the previous one.
         """
-        if time.monotonic() - self._last_send < MIN_INTERVAL:
-            return
+        if self._awaiting_reply:
+            self._drain()
+            if self._awaiting_reply and time.monotonic() - self._last_send < REPLY_TIMEOUT:
+                return False
         dp = self._dev.dpset
         colour = tinytuya.BulbDevice.hsv_to_hexvalue(
             (hue % 360) / 360,
@@ -169,6 +218,7 @@ class TuyaLight:
             dps[dp["mode"]] = "colour"
         self._set(dps)
         self._on, self._mode = True, "colour"
+        return True
 
     def stream_white(self, kelvin: int, brightness: int) -> None:
         """White light: kelvin 2000 (warm) – 6500 (cool), brightness 0–255."""
