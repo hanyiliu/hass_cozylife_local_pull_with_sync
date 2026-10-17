@@ -2,14 +2,10 @@
 tuya_light.py — Tuya / Smart Life Wi-Fi bulbs, driven like a CozyLifeDevice.
 
 Tuya bulbs encrypt their local protocol with a per-device local_key that only
-Tuya's cloud hands out.  Fetch it once with tinytuya's wizard, run from this
-folder so it writes devices.json next to these scripts:
-
-    pip install tinytuya
-    python -m tinytuya wizard      # answer "y" when it offers to poll devices
-
-devices.json then holds each device's id, local key and IP; load_tuya_lights()
-reads it.  It contains secrets, so it is gitignored.
+Tuya's cloud hands out.  Fetch it once with tuya_keys.py (QR login through the
+Smart Life app) or tinytuya's wizard; either writes devices.json next to these
+scripts with each device's id, local key and IP.  load_tuya_lights() reads it.
+It contains secrets, so it is gitignored.
 
 Usage:
     from tuya_light import load_tuya_lights
@@ -249,7 +245,7 @@ def load_tuya_lights(path: str = DEVICES_FILE) -> list[TuyaLight]:
         if not e.get("key"):
             continue
         if not e.get("ip"):
-            print(f"  Tuya {label}: no IP in devices.json — rerun the wizard and let it poll")
+            print(f"  Tuya {label}: no IP in devices.json — rerun tuya_keys.py on this network")
             continue
         try:
             lights.append(TuyaLight(e["id"], e["ip"], e["key"],

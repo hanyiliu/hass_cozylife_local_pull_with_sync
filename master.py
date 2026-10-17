@@ -18,7 +18,7 @@ Usage:
   python master.py 192.168.1.x 192.168.1.y # specific CozyLife IPs
 
 Tuya / Smart Life bulbs listed in devices.json are added either way —
-see tuya_light.py for how to create that file.
+create it with `python tuya_keys.py <user code>`.
 """
 
 import curses
