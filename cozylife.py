@@ -219,6 +219,22 @@ class CozyLifeDevice:
         h, s = _rgb_to_hs(r, g, b)
         self.set_hs(h, s)
 
+    def stream_color(self, hue: float, saturation: float, brightness: int) -> None:
+        """Fire-and-forget colour update for high-rate loops (music, disco).
+
+        hue 0–360, saturation 0–100, brightness 0–255.
+        """
+        self._send(3, {"1": 255, "4": round(brightness * 1000 / 255),
+                       "5": int(hue), "6": int(saturation * 10)})
+        self._drain()
+
+    def stream_white(self, kelvin: int, brightness: int) -> None:
+        """White light: kelvin 2000 (warm) – 6500 (cool), brightness 0–255."""
+        k = max(2000, min(6500, kelvin))
+        self._send(3, {"1": 255, "4": round(brightness * 1000 / 255),
+                       "3": round((k - 2000) / (6500 - 2000) * 1000)})
+        self._drain()
+
     # ------------------------------------------------------------------
     # Discovery
     # ------------------------------------------------------------------

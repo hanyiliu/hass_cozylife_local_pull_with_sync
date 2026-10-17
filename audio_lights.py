@@ -21,6 +21,7 @@ import numpy as np
 import sounddevice as sd
 
 from cozylife import CozyLifeDevice
+from tuya_light import load_tuya_lights
 
 # ------------------------------------------------------------------
 # Tuning
@@ -104,13 +105,7 @@ def light_worker(device: CozyLifeDevice, stop: threading.Event):
 
         if on and b > 5:
             try:
-                device._send(3, {
-                    "1": 255,
-                    "4": round(b * 1000 / 255),
-                    "5": int(h),
-                    "6": int(s * 10),
-                })
-                device._drain()
+                device.stream_color(h, s, b)
             except OSError:
                 # Connection dropped — wait, then reconnect if not stopping.
                 if stop.wait(1.0):
@@ -144,6 +139,7 @@ def main():
     else:
         print("Discovering devices...")
         devices = CozyLifeDevice.discover()
+    devices += load_tuya_lights()
 
     if not devices:
         print("No devices found.")

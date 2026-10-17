@@ -15,7 +15,10 @@ Modes
 
 Usage:
   python master.py                          # auto-discover
-  python master.py 192.168.1.x 192.168.1.y # specific IPs
+  python master.py 192.168.1.x 192.168.1.y # specific CozyLife IPs
+
+Tuya / Smart Life bulbs listed in devices.json are added either way —
+see tuya_light.py for how to create that file.
 """
 
 import curses
@@ -38,6 +41,7 @@ except ImportError:
     _HAS_FIONREAD = False
 
 from cozylife import CozyLifeDevice
+from tuya_light import load_tuya_lights
 
 try:
     import numpy as np
@@ -290,10 +294,7 @@ class Controller:
                 if mode == "disco":
                     hue = random.uniform(0, 360)
                     sat = random.uniform(s.get("sat_min", 60), s.get("sat_max", 100))
-                    bri = round(int(s.get("bri", 255)) * 1000 / 255)
-                    device._send(3, {"1": 255, "4": bri,
-                                     "5": int(hue), "6": int(sat * 10)})
-                    device._drain()
+                    device.stream_color(hue, sat, int(s.get("bri", 255)))
                     sent = True
                     self._stop.wait(s.get("interval", 0.05))
 
@@ -302,9 +303,7 @@ class Controller:
                         h, b, sat = self._a_hue, self._a_bri, self._a_sat
                     h = (h + idx * s.get("hue_spread", 0.0)) % 360
                     if b > 5:
-                        device._send(3, {"1": 255, "4": round(b * 1000 / 255),
-                                         "5": int(h), "6": int(sat * 10)})
-                        device._drain()
+                        device.stream_color(h, sat, b)
                         sent = True
                     self._stop.wait(s.get("light_interval", 0.05))
 
@@ -403,18 +402,13 @@ class Controller:
 
     def _push_manual(self) -> None:
         s   = self.settings["manual"]
-        bri = round(int(s.get("brightness", 200)) * 1000 / 255)
-        if s.get("use_temp", 0) >= 0.5:
-            k = s.get("color_temp", 3500)
-            payload: dict = {"1": 255, "4": bri,
-                             "3": round((k - 2000) / (6500 - 2000) * 1000)}
-        else:
-            payload = {"1": 255, "4": bri,
-                       "5": int(s.get("hue", 0)),
-                       "6": int(s.get("saturation", 90) * 10)}
+        bri = int(s.get("brightness", 200))
         for d in self.devices:
             try:
-                d._send(3, payload)
+                if s.get("use_temp", 0) >= 0.5:
+                    d.stream_white(int(s.get("color_temp", 3500)), bri)
+                else:
+                    d.stream_color(s.get("hue", 0), s.get("saturation", 90), bri)
             except OSError:
                 pass
 
@@ -657,7 +651,7 @@ def _run(stdscr, devices: list[CozyLifeDevice]) -> None:
                 ctrl.status = "Rediscovering..."
                 draw(stdscr, ctrl)
                 ctrl.shutdown()
-                new_devices = CozyLifeDevice.discover()
+                new_devices = CozyLifeDevice.discover() + load_tuya_lights()
                 ctrl = Controller(new_devices)
                 ctrl.status = f"Found {len(new_devices)} device(s)"
             elif key == curses.KEY_RESIZE:
@@ -683,6 +677,7 @@ def main() -> None:
     else:
         print("Discovering devices...")
         devices = CozyLifeDevice.discover()
+    devices += load_tuya_lights()
 
     if not devices:
         print("No devices found. Try: python master.py 192.168.1.x")
